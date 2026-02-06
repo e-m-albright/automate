@@ -48,14 +48,29 @@ COUNT=0
 for f in "$IN_DIR"/*.json; do
   [ -f "$f" ] || continue
   BASENAME=$(basename "$f" .json)
-  # Remove id so n8n creates a new workflow; keep name, nodes, connections, settings, etc.
-  PAYLOAD=$(jq 'del(.id)' "$f")
-  RESP=$(curl -sf -X POST -H "$AUTH_HEADER" -H "Content-Type: application/json" \
+  # API requires settings but rejects extra keys (e.g. executionOrder, binaryMode); send empty object
+  PAYLOAD=$(jq '
+    {
+      name: (.name // "Unnamed"),
+      nodes: [.nodes[]? | del(.credentials)],
+      connections: (.connections // {}),
+      settings: {}
+    }
+  ' "$f")
+  RESP=$(curl -s -w "\n%{http_code}" -X POST -H "$AUTH_HEADER" -H "Content-Type: application/json" \
     -d "$PAYLOAD" "${API_URL}/workflows")
-  NEW_ID=$(echo "$RESP" | jq -r '.id')
-  NEW_NAME=$(echo "$RESP" | jq -r '.name')
-  echo "  Imported: ${BASENAME}.json → ${NEW_NAME} (id: ${NEW_ID})"
-  COUNT=$((COUNT + 1))
+  HTTP_CODE=$(echo "$RESP" | tail -n1)
+  BODY=$(echo "$RESP" | sed '$d')
+  if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
+    NEW_ID=$(echo "$BODY" | jq -r '.id')
+    NEW_NAME=$(echo "$BODY" | jq -r '.name')
+    echo "  Imported: ${BASENAME}.json → ${NEW_NAME} (id: ${NEW_ID})"
+    COUNT=$((COUNT + 1))
+  else
+    echo "Error: n8n returned HTTP ${HTTP_CODE} for ${BASENAME}.json"
+    echo "$BODY" | jq . 2>/dev/null || echo "$BODY"
+    exit 1
+  fi
 done
 
 echo ""

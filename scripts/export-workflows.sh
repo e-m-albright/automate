@@ -44,13 +44,10 @@ if [ -z "$WORKFLOWS" ]; then
   exit 1
 fi
 
-# Only export non-archived workflows (archived ones have archivedAt set)
-WORKFLOW_IDS=$(echo "$WORKFLOWS" | jq -r '.data[] | select((.archivedAt // "") == "") | .id')
-COUNT=$(echo "$WORKFLOW_IDS" | grep -c . 2>/dev/null || echo 0)
-echo "Found ${COUNT} active workflow(s) (archived workflows excluded)."
+COUNT=$(echo "$WORKFLOWS" | jq '.data | length')
+echo "Found ${COUNT} workflow(s)."
 
-echo "$WORKFLOW_IDS" | while read -r WF_ID; do
-  [ -z "$WF_ID" ] && continue
+echo "$WORKFLOWS" | jq -r '.data[] | .id' | while read -r WF_ID; do
   # Fetch full workflow
   WF_JSON=$(curl -sf -H "$AUTH_HEADER" "${API_URL}/workflows/${WF_ID}")
 

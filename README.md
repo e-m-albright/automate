@@ -2,6 +2,11 @@
 
 Email and content automation with [n8n](https://n8n.io/) and [Ollama](https://ollama.com/) for local LLM.
 
+## TODO
+
+- Create gmail label id strip + lookup dict
+- webhookid mask too
+
 ## Quick start
 
 ```bash
