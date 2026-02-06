@@ -1,0 +1,371 @@
+{
+  "name": "Content Pipeline",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "content",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "e1000001-0001-4000-8000-000000000001",
+      "name": "Bookmark Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1.1,
+      "position": [220, 300],
+      "webhookId": "content"
+    },
+    {
+      "parameters": {
+        "pollTimes": {
+          "item": [{ "mode": "everyX", "value": 5, "unit": "minutes" }]
+        },
+        "filters": {}
+      },
+      "id": "e1000001-0001-4000-8000-000000000002",
+      "name": "Gmail Trigger",
+      "type": "n8n-nodes-base.gmailTrigger",
+      "typeVersion": 1,
+      "position": [220, 540]
+    },
+    {
+      "parameters": {
+        "language": "python",
+        "pythonCode": "import json\n\nresults = []\nfor item in _input.all():\n    data = item.json\n\n    # Bookmark webhook: body contains { url, title, folder }\n    if 'body' in data and isinstance(data.get('body'), dict) and 'url' in data.get('body', {}):\n        results.append({\n            'json': {\n                'source_type': 'bookmark',\n                'url': data['body']['url'],\n                'title': data['body'].get('title', ''),\n                'folder': data['body'].get('folder', ''),\n                'content': '',\n                'email_id': '',\n                'email_from': '',\n                'email_subject': '',\n            }\n        })\n    else:\n        # Gmail trigger\n        email_text = data.get('text', data.get('snippet', data.get('body', '')))\n        # Truncate email body for LLM context\n        if isinstance(email_text, str) and len(email_text) > 8000:\n            email_text = email_text[:8000]\n        results.append({\n            'json': {\n                'source_type': 'email',\n                'url': '',\n                'title': data.get('subject', ''),\n                'folder': '',\n                'content': email_text or '',\n                'email_id': data.get('id', ''),\n                'email_from': data.get('from', ''),\n                'email_subject': data.get('subject', ''),\n            }\n        })\n\nreturn results"
+      },
+      "id": "e1000001-0001-4000-8000-000000000003",
+      "name": "Normalize Input",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [500, 400]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "" },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.source_type }}",
+              "rightValue": "bookmark",
+              "operator": { "type": "string", "operation": "equals" }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "e1000001-0001-4000-8000-000000000004",
+      "name": "Is Bookmark?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [720, 400]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://sidecar:8000/content/fetch",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ url: $json.url }) }}",
+        "options": { "timeout": 25000 }
+      },
+      "id": "e1000001-0001-4000-8000-000000000005",
+      "name": "Fetch Content",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [960, 300],
+      "notes": "Calls sidecar to fetch URL and return clean markdown via BeautifulSoup."
+    },
+    {
+      "parameters": {
+        "language": "python",
+        "pythonCode": "# Merge fetched content back with the normalized bookmark data\nfetched = _input.first().json\nnormalized = $('Is Bookmark?').first().json\n\n# Use page title from fetch if we didn't have one\ntitle = normalized.get('title', '') or fetched.get('title', '')\n\nreturn [{\n    'json': {\n        **normalized,\n        'title': title,\n        'content': fetched.get('content_markdown', ''),\n        'word_count': fetched.get('word_count', 0),\n    }\n}]"
+      },
+      "id": "e1000001-0001-4000-8000-000000000006",
+      "name": "Merge Fetched Content",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1180, 300]
+    },
+    {
+      "parameters": {
+        "language": "python",
+        "pythonCode": "# Email content is already text — just pass through with word count\nitem = _input.first().json\ncontent = item.get('content', '')\nword_count = len(content.split()) if content else 0\n\nreturn [{\n    'json': {\n        **item,\n        'word_count': word_count,\n    }\n}]"
+      },
+      "id": "e1000001-0001-4000-8000-000000000007",
+      "name": "Email Passthrough",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [960, 520]
+    },
+    {
+      "parameters": {
+        "mode": "chooseBranch",
+        "output": "empty"
+      },
+      "id": "e1000001-0001-4000-8000-000000000008",
+      "name": "Merge Paths",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3,
+      "position": [1400, 400]
+    },
+    {
+      "parameters": {
+        "language": "python",
+        "pythonCode": "# Build the classification prompt.\n# n8n's native Ollama node would be better here, but we use a Code node\n# to construct the prompt dynamically, then the next HTTP Request node\n# sends it to Ollama's /api/chat endpoint.\n\nitem = _input.first().json\nsource_type = item.get('source_type', 'bookmark')\ntitle = item.get('title', '')\ncontent = item.get('content', '')\nemail_from = item.get('email_from', '')\nemail_subject = item.get('email_subject', '')\n\n# Build context block\ncontext = f'Source: {source_type}\\n'\nif source_type == 'email':\n    context += f'From: {email_from}\\nSubject: {email_subject}\\n'\ncontext += f'Title: {title}\\n\\nContent:\\n{content[:6000]}'\n\nprompt = f\"\"\"You are a content classifier. Analyze the following content and return ONLY valid JSON, nothing else.\n\n{context}\n\nClassify into this exact JSON structure:\n{{\n  \"content_type\": \"article | newsletter | email_thread | receipt | social | reference | tool\",\n  \"domain\": \"professional | personal\",\n  \"topic\": \"ai_ml | software_engineering | psychology_motivation | startups | career | shopping | parenting | travel | finance | health | entertainment | other\",\n  \"subtopic\": \"specific subtopic in snake_case, e.g. reinforcement_learning\",\n  \"priority\": 1-5 where 5 is most important/urgent,\n  \"summary\": \"2-3 sentence summary of the key content\",\n  \"key_takeaways\": [\"up to 3 key points\"],\n  \"suggested_tags\": [\"up to 5 tags\"],\n  \"blog_section\": \"mindmap for deep research, feed for news/updates, or none\",\n  \"action\": \"publish_blog | email_digest | flag_reply | archive | discard\"\n}}\n\nRouting rules:\n- Professional topics (AI/ML, software engineering, psychology/motivation, startups, career advice) with substantial content → publish_blog\n- Professional deep dives → blog_section: mindmap\n- Professional news/brief updates → blog_section: feed  \n- Professional emails needing a reply → flag_reply\n- Personal high-priority (shopping deals, important family stuff) → email_digest\n- Personal low-priority → discard\n- Receipts, confirmations → archive\n- Newsletters: classify by domain first, then route accordingly\"\"\"\n\nreturn [{\n    'json': {\n        **item,\n        'classification_prompt': prompt,\n    }\n}]"
+      },
+      "id": "e1000001-0001-4000-8000-000000000009",
+      "name": "Build Classification Prompt",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1620, 400]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://ollama:11434/api/chat",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ model: 'qwen2.5:7b', messages: [{ role: 'user', content: $json.classification_prompt }], stream: false, options: { temperature: 0.2 } }) }}",
+        "options": { "timeout": 120000 }
+      },
+      "id": "e1000001-0001-4000-8000-000000000010",
+      "name": "Classify with Ollama",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1860, 400],
+      "notes": "Sends classification prompt to Ollama. Uses HTTP Request instead of n8n Ollama node for simplicity — no credential setup needed."
+    },
+    {
+      "parameters": {
+        "language": "python",
+        "pythonCode": "import json\n\nitem = _input.first().json\nprevious = $('Build Classification Prompt').first().json\n\n# Extract LLM response text\nllm_text = ''\nif 'message' in item and 'content' in item['message']:\n    llm_text = item['message']['content']\nelif 'response' in item:\n    llm_text = item['response']\n\n# Parse JSON from the LLM response (may be wrapped in markdown code blocks)\ntry:\n    # Strip markdown code fences if present\n    cleaned = llm_text.strip()\n    if cleaned.startswith('```'):\n        lines = cleaned.split('\\n')\n        cleaned = '\\n'.join(lines[1:])\n        if cleaned.endswith('```'):\n            cleaned = cleaned[:-3]\n        cleaned = cleaned.strip()\n    \n    start = cleaned.index('{')\n    end = cleaned.rindex('}') + 1\n    classification = json.loads(cleaned[start:end])\nexcept (ValueError, json.JSONDecodeError):\n    # Fallback: safe defaults if LLM returns garbage\n    classification = {\n        'content_type': 'article',\n        'domain': 'personal',\n        'topic': 'other',\n        'subtopic': '',\n        'priority': 3,\n        'summary': llm_text[:200] if llm_text else 'Classification failed',\n        'key_takeaways': [],\n        'suggested_tags': [],\n        'blog_section': 'none',\n        'action': 'email_digest',\n    }\n\n# Merge classification with original content data\nresult = {}\nfor key in ['source_type', 'url', 'title', 'folder', 'content', 'email_id', 'email_from', 'email_subject', 'word_count']:\n    result[key] = previous.get(key, '')\n\nresult.update(classification)\n\nreturn [{'json': result}]"
+      },
+      "id": "e1000001-0001-4000-8000-000000000011",
+      "name": "Parse Classification",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2100, 400]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": { "caseSensitive": true, "leftValue": "" },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.action }}",
+                    "rightValue": "publish_blog",
+                    "operator": { "type": "string", "operation": "equals" }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "professional"
+            },
+            {
+              "conditions": {
+                "options": { "caseSensitive": true, "leftValue": "" },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.action }}",
+                    "rightValue": "email_digest",
+                    "operator": { "type": "string", "operation": "equals" }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "personal"
+            },
+            {
+              "conditions": {
+                "options": { "caseSensitive": true, "leftValue": "" },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.action }}",
+                    "rightValue": "flag_reply",
+                    "operator": { "type": "string", "operation": "equals" }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "flag_reply"
+            },
+            {
+              "conditions": {
+                "options": { "caseSensitive": true, "leftValue": "" },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.action }}",
+                    "rightValue": "archive",
+                    "operator": { "type": "string", "operation": "equals" }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "archive"
+            }
+          ],
+          "fallbackOutput": {
+            "renameOutput": true,
+            "outputKey": "discard"
+          }
+        },
+        "options": { "allMatchingOutputs": false }
+      },
+      "id": "e1000001-0001-4000-8000-000000000012",
+      "name": "Route by Action",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3,
+      "position": [2340, 400]
+    },
+    {
+      "parameters": {
+        "workflowId": "={{ $workflow.id }}",
+        "options": {}
+      },
+      "id": "e1000001-0001-4000-8000-000000000013",
+      "name": "Professional Content",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1,
+      "position": [2600, 160],
+      "notes": "CONFIGURE: Set workflowId to the ID of workflow 06-professional-content after importing it."
+    },
+    {
+      "parameters": {
+        "workflowId": "={{ $workflow.id }}",
+        "options": {}
+      },
+      "id": "e1000001-0001-4000-8000-000000000014",
+      "name": "Personal Content",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1,
+      "position": [2600, 360],
+      "notes": "CONFIGURE: Set workflowId to the ID of workflow 07-personal-content after importing it."
+    },
+    {
+      "parameters": {
+        "language": "python",
+        "pythonCode": "# Flag email for reply: star it and add label so workflow 08 picks it up.\n# This node outputs the email_id for the Gmail node to act on.\nitem = _input.first().json\n\nreturn [{\n    'json': {\n        'email_id': item.get('email_id', ''),\n        'action': 'flag_reply',\n        'summary': item.get('summary', ''),\n    }\n}]"
+      },
+      "id": "e1000001-0001-4000-8000-000000000015",
+      "name": "Prepare Flag Reply",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2600, 540]
+    },
+    {
+      "parameters": {},
+      "id": "e1000001-0001-4000-8000-000000000016",
+      "name": "Archive Email",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [2600, 720],
+      "notes": "CONFIGURE: Replace with Gmail node — operation: addLabels (automate/processed), then remove from inbox."
+    },
+    {
+      "parameters": {},
+      "id": "e1000001-0001-4000-8000-000000000017",
+      "name": "Discard",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [2600, 880],
+      "notes": "Discarded content. Bookmark gets deleted via extension response. Email newsletters get archived."
+    },
+    {
+      "parameters": {
+        "language": "python",
+        "pythonCode": "# Post-process: determine what cleanup to perform.\n# For bookmarks: the webhook response triggers the extension to delete/move.\n# For emails: downstream Gmail nodes handle archiving.\n\nitems = _input.all()\nresults = []\nfor item in items:\n    d = item.json\n    source_type = d.get('source_type', '')\n    action = d.get('action', 'discard')\n    \n    results.append({\n        'json': {\n            'source_type': source_type,\n            'action': action,\n            'title': d.get('title', ''),\n            'domain': d.get('domain', ''),\n            'topic': d.get('topic', ''),\n            'summary': d.get('summary', ''),\n            'blog_section': d.get('blog_section', 'none'),\n            'email_id': d.get('email_id', ''),\n            'url': d.get('url', ''),\n        }\n    })\n\nreturn results"
+      },
+      "id": "e1000001-0001-4000-8000-000000000018",
+      "name": "Post-Process Cleanup",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2880, 400]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ status: 'processed', action: $json.action, title: $json.title, domain: $json.domain, topic: $json.topic, blog_section: $json.blog_section }) }}"
+      },
+      "id": "e1000001-0001-4000-8000-000000000019",
+      "name": "Respond to Extension",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [3120, 400],
+      "notes": "Returns processing result to Chrome extension. The extension will delete/move the bookmark based on its own settings."
+    }
+  ],
+  "connections": {
+    "Bookmark Webhook": {
+      "main": [[{ "node": "Normalize Input", "type": "main", "index": 0 }]]
+    },
+    "Gmail Trigger": {
+      "main": [[{ "node": "Normalize Input", "type": "main", "index": 0 }]]
+    },
+    "Normalize Input": {
+      "main": [[{ "node": "Is Bookmark?", "type": "main", "index": 0 }]]
+    },
+    "Is Bookmark?": {
+      "main": [
+        [{ "node": "Fetch Content", "type": "main", "index": 0 }],
+        [{ "node": "Email Passthrough", "type": "main", "index": 0 }]
+      ]
+    },
+    "Fetch Content": {
+      "main": [[{ "node": "Merge Fetched Content", "type": "main", "index": 0 }]]
+    },
+    "Merge Fetched Content": {
+      "main": [[{ "node": "Merge Paths", "type": "main", "index": 0 }]]
+    },
+    "Email Passthrough": {
+      "main": [[{ "node": "Merge Paths", "type": "main", "index": 1 }]]
+    },
+    "Merge Paths": {
+      "main": [[{ "node": "Build Classification Prompt", "type": "main", "index": 0 }]]
+    },
+    "Build Classification Prompt": {
+      "main": [[{ "node": "Classify with Ollama", "type": "main", "index": 0 }]]
+    },
+    "Classify with Ollama": {
+      "main": [[{ "node": "Parse Classification", "type": "main", "index": 0 }]]
+    },
+    "Parse Classification": {
+      "main": [[{ "node": "Route by Action", "type": "main", "index": 0 }]]
+    },
+    "Route by Action": {
+      "main": [
+        [{ "node": "Professional Content", "type": "main", "index": 0 }],
+        [{ "node": "Personal Content", "type": "main", "index": 0 }],
+        [{ "node": "Prepare Flag Reply", "type": "main", "index": 0 }],
+        [{ "node": "Archive Email", "type": "main", "index": 0 }],
+        [{ "node": "Discard", "type": "main", "index": 0 }]
+      ]
+    },
+    "Professional Content": {
+      "main": [[{ "node": "Post-Process Cleanup", "type": "main", "index": 0 }]]
+    },
+    "Personal Content": {
+      "main": [[{ "node": "Post-Process Cleanup", "type": "main", "index": 0 }]]
+    },
+    "Prepare Flag Reply": {
+      "main": [[{ "node": "Post-Process Cleanup", "type": "main", "index": 0 }]]
+    },
+    "Archive Email": {
+      "main": [[{ "node": "Post-Process Cleanup", "type": "main", "index": 0 }]]
+    },
+    "Discard": {
+      "main": [[{ "node": "Post-Process Cleanup", "type": "main", "index": 0 }]]
+    },
+    "Post-Process Cleanup": {
+      "main": [[{ "node": "Respond to Extension", "type": "main", "index": 0 }]]
+    }
+  },
+  "settings": { "executionOrder": "v1" },
+  "meta": { "templateCredsSetupCompleted": false }
+}

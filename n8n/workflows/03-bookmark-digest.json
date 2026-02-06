@@ -1,0 +1,107 @@
+{
+  "name": "Daily Bookmark Digest",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            { "field": "hours", "hoursInterval": 24 }
+          ]
+        }
+      },
+      "id": "c1000001-0000-0000-0000-000000000001",
+      "name": "Daily Schedule",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.1,
+      "position": [240, 300]
+    },
+    {
+      "parameters": {
+        "url": "http://sidecar:8000/bookmarks/list?since_days=1&limit=20",
+        "options": {}
+      },
+      "id": "c1000001-0000-0000-0000-000000000002",
+      "name": "Fetch New Bookmarks",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [480, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "const data = $input.first().json;\nif (!data.bookmarks || data.bookmarks.length === 0) {\n  return [];\n}\nreturn data.bookmarks.map(b => ({ json: b }));"
+      },
+      "id": "c1000001-0000-0000-0000-000000000003",
+      "name": "Split Bookmarks",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [720, 300]
+    },
+    {
+      "parameters": {
+        "batchSize": 3,
+        "options": {}
+      },
+      "id": "c1000001-0000-0000-0000-000000000004",
+      "name": "Batch of 3",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [960, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://sidecar:8000/bookmarks/digest",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ url: $json.url, title: $json.title || '' }) }}"
+      },
+      "id": "c1000001-0000-0000-0000-000000000005",
+      "name": "Digest Bookmark",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1200, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "const items = $input.all();\nlet md = '# Bookmark Digest\\n\\n';\nmd += `*${items.length} new bookmark(s)*\\n\\n`;\nfor (const item of items) {\n  const d = item.json;\n  md += `## ${d.title || d.url}\\n\\n`;\n  md += `${d.summary || 'No summary available.'}\\n\\n`;\n  if (d.key_takeaways && d.key_takeaways.length) {\n    md += '**Takeaways:**\\n';\n    for (const t of d.key_takeaways) {\n      md += `- ${t}\\n`;\n    }\n    md += '\\n';\n  }\n  md += `*${d.category || 'uncategorized'} · ${d.read_time_minutes || '?'} min read*\\n\\n`;\n  md += `[Read original](${d.url})\\n\\n---\\n\\n`;\n}\nreturn [{ json: { digest_markdown: md, count: items.length } }];"
+      },
+      "id": "c1000001-0000-0000-0000-000000000006",
+      "name": "Format Digest",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1440, 300],
+      "notes": "Outputs a markdown digest. Connect to an email node to send it to yourself, or a file node to save it."
+    },
+    {
+      "parameters": {},
+      "id": "c1000001-0000-0000-0000-000000000007",
+      "name": "Output",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [1680, 300],
+      "notes": "Replace this with: Send Email (to yourself), Write to File, or HTTP Request to your Astro blog API."
+    }
+  ],
+  "connections": {
+    "Daily Schedule": {
+      "main": [[{ "node": "Fetch New Bookmarks", "type": "main", "index": 0 }]]
+    },
+    "Fetch New Bookmarks": {
+      "main": [[{ "node": "Split Bookmarks", "type": "main", "index": 0 }]]
+    },
+    "Split Bookmarks": {
+      "main": [[{ "node": "Batch of 3", "type": "main", "index": 0 }]]
+    },
+    "Batch of 3": {
+      "main": [[{ "node": "Digest Bookmark", "type": "main", "index": 0 }]]
+    },
+    "Digest Bookmark": {
+      "main": [[{ "node": "Format Digest", "type": "main", "index": 0 }]]
+    },
+    "Format Digest": {
+      "main": [[{ "node": "Output", "type": "main", "index": 0 }]]
+    }
+  },
+  "settings": { "executionOrder": "v1" },
+  "meta": { "templateCredsSetupCompleted": false }
+}

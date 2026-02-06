@@ -1,0 +1,107 @@
+{
+  "name": "Inbox Cleanup (Batch Old Emails)",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "b1000001-0000-0000-0000-000000000001",
+      "name": "Start Cleanup",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [240, 300]
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "operation": "getAll",
+        "returnAll": false,
+        "limit": 50,
+        "filters": {
+          "q": "is:inbox older_than:30d -is:starred"
+        }
+      },
+      "id": "b1000001-0000-0000-0000-000000000002",
+      "name": "Fetch Old Emails",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [480, 300],
+      "notes": "Connect your Gmail credential. Adjust the query and limit as needed."
+    },
+    {
+      "parameters": {
+        "batchSize": 1,
+        "options": {}
+      },
+      "id": "b1000001-0000-0000-0000-000000000003",
+      "name": "One at a Time",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [720, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://sidecar:8000/llm/analyze",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ content: 'From: ' + ($json.from || '') + '\\nSubject: ' + ($json.subject || '') + '\\n\\n' + ($json.text || $json.snippet || ''), analysis_prompt: '{content}\\n\\nClassify this email. Respond ONLY with JSON:\\n{\"category\": \"JUNK\", \"reason\": \"brief\", \"suggested_action\": \"archive\", \"priority\": 1}\\nCategories: JUNK, NEWSLETTER, RECEIPT, SOCIAL, ACTIONABLE, FYI, PERSONAL, IMPORTANT\\nActions: archive, delete, unsubscribe, keep\\nPriority: 1-5' }) }}"
+      },
+      "id": "b1000001-0000-0000-0000-000000000004",
+      "name": "Classify",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [960, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "const input = $input.first().json;\nconst email = $('One at a Time').first().json;\nlet parsed;\ntry {\n  parsed = JSON.parse(input.result);\n} catch(e) {\n  parsed = { category: 'FYI', suggested_action: 'keep', reason: (input.result || '').substring(0, 200), priority: 3 };\n}\nreturn [{\n  json: {\n    category: parsed.category || 'FYI',\n    reason: parsed.reason || '',\n    suggested_action: parsed.suggested_action || 'keep',\n    priority: parsed.priority || 3,\n    email_id: email.id,\n    email_from: email.from || '',\n    email_subject: email.subject || '',\n    kept_local: input.kept_local\n  }\n}];"
+      },
+      "id": "b1000001-0000-0000-0000-000000000005",
+      "name": "Parse Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1200, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "const d = $input.first().json;\nconst msg = `**${d.email_subject}**\\nFrom: ${d.email_from}\\nCategory: ${d.category}\\nSuggested: ${d.suggested_action}\\nReason: ${d.reason}\\nPrivacy: ${d.kept_local ? 'Kept local' : 'Used cloud'}`;\nreturn [{ json: { ...d, review_message: msg } }];"
+      },
+      "id": "b1000001-0000-0000-0000-000000000006",
+      "name": "Format for Review",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1440, 300],
+      "notes": "Add a 'Wait for Approval' or 'Send Email' node after this to review before acting. For now this outputs the classification so you can inspect it in the n8n execution log."
+    },
+    {
+      "parameters": {},
+      "id": "b1000001-0000-0000-0000-000000000007",
+      "name": "Done",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [1680, 300],
+      "notes": "Wire Gmail action nodes here after the approval step. Use Switch to route by suggested_action (archive, delete, keep, etc.)"
+    }
+  ],
+  "connections": {
+    "Start Cleanup": {
+      "main": [[{ "node": "Fetch Old Emails", "type": "main", "index": 0 }]]
+    },
+    "Fetch Old Emails": {
+      "main": [[{ "node": "One at a Time", "type": "main", "index": 0 }]]
+    },
+    "One at a Time": {
+      "main": [[{ "node": "Classify", "type": "main", "index": 0 }]]
+    },
+    "Classify": {
+      "main": [[{ "node": "Parse Result", "type": "main", "index": 0 }]]
+    },
+    "Parse Result": {
+      "main": [[{ "node": "Format for Review", "type": "main", "index": 0 }]]
+    },
+    "Format for Review": {
+      "main": [[{ "node": "Done", "type": "main", "index": 0 }]]
+    }
+  },
+  "settings": { "executionOrder": "v1" },
+  "meta": { "templateCredsSetupCompleted": false }
+}

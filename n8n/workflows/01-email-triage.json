@@ -1,0 +1,132 @@
+{
+  "name": "Email Triage",
+  "nodes": [
+    {
+      "parameters": {
+        "pollTimes": {
+          "item": [
+            { "mode": "everyHour" }
+          ]
+        },
+        "simple": false
+      },
+      "id": "a1000001-0000-0000-0000-000000000001",
+      "name": "New Email",
+      "type": "n8n-nodes-base.gmailTrigger",
+      "typeVersion": 1,
+      "position": [240, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://sidecar:8000/llm/analyze",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ content: 'From: ' + $json.from + '\\nSubject: ' + $json.subject + '\\n\\n' + ($json.text || $json.snippet || ''), analysis_prompt: '{content}\\n\\nClassify this email into ONE category. Respond ONLY with JSON:\\n{\"category\": \"JUNK\", \"reason\": \"brief\", \"suggested_action\": \"archive\", \"priority\": 1}\\nCategories: JUNK, NEWSLETTER, RECEIPT, SOCIAL, ACTIONABLE, FYI, PERSONAL, IMPORTANT\\nActions: archive, delete, unsubscribe, label, draft_reply, keep\\nPriority: 1-5' }) }}"
+      },
+      "id": "a1000001-0000-0000-0000-000000000002",
+      "name": "Classify Email",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [480, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "const input = $input.first().json;\nlet parsed;\ntry {\n  parsed = JSON.parse(input.result);\n} catch(e) {\n  parsed = { category: 'FYI', reason: input.result || 'parse error', suggested_action: 'keep', priority: 3 };\n}\nreturn [{\n  json: {\n    category: parsed.category || 'FYI',\n    reason: parsed.reason || '',\n    suggested_action: parsed.suggested_action || 'keep',\n    priority: parsed.priority || 3,\n    email_id: $('New Email').first().json.id,\n    email_from: $('New Email').first().json.from,\n    email_subject: $('New Email').first().json.subject,\n    email_snippet: $('New Email').first().json.snippet,\n    kept_local: input.kept_local,\n    provider_used: input.provider_used\n  }\n}];"
+      },
+      "id": "a1000001-0000-0000-0000-000000000003",
+      "name": "Parse Classification",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [720, 300]
+    },
+    {
+      "parameters": {
+        "dataType": "string",
+        "value1": "={{ $json.category }}",
+        "rules": {
+          "rules": [
+            { "value2": "JUNK" },
+            { "value2": "NEWSLETTER" },
+            { "value2": "ACTIONABLE" }
+          ]
+        },
+        "fallbackOutput": 3
+      },
+      "id": "a1000001-0000-0000-0000-000000000004",
+      "name": "Route by Category",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 1,
+      "position": [960, 300]
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "operation": "delete",
+        "messageId": "={{ $json.email_id }}"
+      },
+      "id": "a1000001-0000-0000-0000-000000000005",
+      "name": "Trash Junk",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [1260, 100],
+      "notes": "Moves to trash (recoverable 30 days). Connect your Gmail credential here."
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "operation": "markAsRead",
+        "messageId": "={{ $json.email_id }}"
+      },
+      "id": "a1000001-0000-0000-0000-000000000006",
+      "name": "Archive Newsletter",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [1260, 300],
+      "notes": "Mark read + you can add a label step. Configure the Gmail action you want here."
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "operation": "addLabels",
+        "messageId": "={{ $json.email_id }}",
+        "labelIds": ["STARRED"]
+      },
+      "id": "a1000001-0000-0000-0000-000000000007",
+      "name": "Star Actionable",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [1260, 500],
+      "notes": "Stars the email so it stands out. Connect your Gmail credential here."
+    },
+    {
+      "parameters": {},
+      "id": "a1000001-0000-0000-0000-000000000008",
+      "name": "Log Other",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [1260, 700]
+    }
+  ],
+  "connections": {
+    "New Email": {
+      "main": [[{ "node": "Classify Email", "type": "main", "index": 0 }]]
+    },
+    "Classify Email": {
+      "main": [[{ "node": "Parse Classification", "type": "main", "index": 0 }]]
+    },
+    "Parse Classification": {
+      "main": [[{ "node": "Route by Category", "type": "main", "index": 0 }]]
+    },
+    "Route by Category": {
+      "main": [
+        [{ "node": "Trash Junk", "type": "main", "index": 0 }],
+        [{ "node": "Archive Newsletter", "type": "main", "index": 0 }],
+        [{ "node": "Star Actionable", "type": "main", "index": 0 }],
+        [{ "node": "Log Other", "type": "main", "index": 0 }]
+      ]
+    }
+  },
+  "settings": { "executionOrder": "v1" },
+  "meta": { "templateCredsSetupCompleted": false }
+}

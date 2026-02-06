@@ -1,6 +1,7 @@
-version: "3.8"
-
 services:
+  # =========================================================================
+  # n8n — the main application. Build workflows at http://localhost:5678
+  # =========================================================================
   n8n:
     image: n8nio/n8n:latest
     container_name: automate-n8n
@@ -16,17 +17,29 @@ services:
       - N8N_PROTOCOL=http
       - WEBHOOK_URL=http://localhost:5678/
       - GENERIC_TIMEZONE=${TIMEZONE:-America/New_York}
+      # Enable the public API so n8n-MCP can manage workflows programmatically
+      - N8N_PUBLIC_API_ENABLED=true
+      # Let n8n workflows call the sidecar and Ollama by container name
+      - SIDECAR_URL=http://sidecar:8000
+      - OLLAMA_BASE_URL=http://ollama:11434
     volumes:
       - n8n_data:/home/node/.n8n
-      - ./n8n/workflows:/home/node/workflows
+    depends_on:
+      - sidecar
+      - ollama
     networks:
       - automate
 
-  api:
+  # =========================================================================
+  # Sidecar — tiny API for things n8n can't do natively
+  #   - Chrome bookmark parsing (local filesystem access)
+  #   - Privacy-first LLM routing (local screening → cloud analysis)
+  # =========================================================================
+  sidecar:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: automate-api
+    container_name: automate-sidecar
     restart: unless-stopped
     ports:
       - "8000:8000"
@@ -34,19 +47,19 @@ services:
       - OLLAMA_BASE_URL=http://ollama:11434
       - CLAUDE_API_KEY=${CLAUDE_API_KEY:-}
       - GEMINI_API_KEY=${GEMINI_API_KEY:-}
-      - GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID:-}
-      - GOOGLE_CLIENT_SECRET=${GOOGLE_CLIENT_SECRET:-}
-      - DATABASE_URL=sqlite:///data/automate.db
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
     volumes:
       - ./services:/app/services
       - ./config:/app/config
-      - api_data:/app/data
     depends_on:
       - ollama
     networks:
       - automate
 
+  # =========================================================================
+  # Ollama — local LLM inference (privacy-first, nothing leaves your machine)
+  # =========================================================================
   ollama:
     image: ollama/ollama:latest
     container_name: automate-ollama
@@ -68,7 +81,6 @@ services:
 
 volumes:
   n8n_data:
-  api_data:
   ollama_data:
 
 networks:

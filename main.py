@@ -1,28 +1,27 @@
+"""Automate sidecar — lightweight API for things n8n can't do natively.
+
+n8n handles: Gmail, scheduling, approval workflows, LLM nodes, action execution.
+This sidecar handles: URL content fetching (BeautifulSoup + markdownify),
+Chrome bookmark file parsing (host filesystem access from Docker).
+
+n8n workflows call these endpoints via HTTP Request nodes.
+"""
+
 import logging
 from contextlib import asynccontextmanager
-from datetime import UTC
+from datetime import UTC, datetime, timedelta
 
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from config.settings import settings
-from services.actions.executor import execute_approved_actions
 from services.bookmarks.ingester import (
     fetch_and_distill,
+    fetch_url_content,
     find_chrome_bookmarks_path,
     parse_chrome_bookmarks,
 )
-from services.database import get_session, init_db
-from services.gmail.classifier import batch_classify
-from services.gmail.client import GmailClient
 from services.llm import llm_router
-from services.review.queue import (
-    approve_batch,
-    create_email_review_batch,
-    get_batch_details,
-    get_pending_batches,
-)
 
 logging.basicConfig(level=getattr(logging, settings.log_level))
 log = logging.getLogger(__name__)
@@ -30,21 +29,22 @@ log = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    await init_db()
     health = await llm_router.health()
     log.info(f"LLM providers: {health}")
     yield
 
 
 app = FastAPI(
-    title="Automate",
-    description="Privacy-first email & content automation",
-    version="0.1.0",
+    title="Automate Sidecar",
+    description="URL content fetching & Chrome bookmark parsing for n8n workflows",
+    version="0.3.0",
     lifespan=lifespan,
 )
 
 
-# --- Health ---
+# =============================================================================
+# Health
+# =============================================================================
 
 
 @app.get("/health")
@@ -55,244 +55,136 @@ async def health():
     }
 
 
-# --- Gmail OAuth ---
+# =============================================================================
+# Content — fetch any URL and return clean markdown (the sidecar's core job)
+# =============================================================================
 
 
-class OAuthSetupRequest(BaseModel):
-    account_name: str
-    email: str
+class ContentFetchRequest(BaseModel):
+    """Fetch a URL and return clean markdown content.
+
+    This is the sidecar's primary purpose: BeautifulSoup + markdownify
+    strips boilerplate and produces LLM-ready text that n8n's native
+    Ollama/Claude nodes can then classify and summarize.
+    """
+
+    url: str
+    max_chars: int = 8000
 
 
-@app.post("/accounts/gmail/auth-url")
-async def gmail_auth_url():
-    """Get the OAuth URL for Gmail setup. User visits this in their browser."""
-    from google_auth_oauthlib.flow import InstalledAppFlow
+@app.post("/content/fetch")
+async def content_fetch(req: ContentFetchRequest):
+    """Fetch a URL, strip HTML boilerplate, return clean markdown.
 
-    flow = InstalledAppFlow.from_client_config(
-        {
-            "installed": {
-                "client_id": settings.google_client_id,
-                "client_secret": settings.google_client_secret,
-                "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-                "token_uri": "https://oauth2.googleapis.com/token",
-                "redirect_uris": ["http://localhost:8080"],
-            }
-        },
-        scopes=[
-            "https://www.googleapis.com/auth/gmail.readonly",
-            "https://www.googleapis.com/auth/gmail.modify",
-            "https://www.googleapis.com/auth/gmail.labels",
-        ],
-    )
-    auth_url, _ = flow.authorization_url(prompt="consent", access_type="offline")
-    return {"auth_url": auth_url}
+    n8n workflow 05 calls this for bookmark URLs. Email content
+    doesn't need this — it's already text.
 
-
-# --- Email Processing ---
-
-
-class ProcessEmailsRequest(BaseModel):
-    account_id: int
-    query: str = "is:inbox"
-    max_results: int = 50
-
-
-@app.post("/emails/process")
-async def process_emails(
-    req: ProcessEmailsRequest,
-    session: AsyncSession = Depends(get_session),
-):
-    """Fetch, classify, and create a review batch. No actions taken yet."""
-    from services.database import Account
-
-    account = await session.get(Account, req.account_id)
-    if not account or not account.google_refresh_token:
-        raise HTTPException(400, "Account not found or not connected to Gmail")
-
-    gmail = GmailClient.from_refresh_token(account.google_refresh_token)
-    messages, next_page = gmail.fetch_messages(query=req.query, max_results=req.max_results)
-
-    if not messages:
-        return {"message": "No emails to process", "batch_id": None}
-
-    classifications = await batch_classify(messages)
-    emails_map = {m.id: m for m in messages}
-    batch = await create_email_review_batch(session, account.id, classifications, emails_map)
-
+    Returns:
+        content_markdown: Clean markdown text (truncated to max_chars)
+        title: Page <title> if found
+        word_count: Approximate word count
+        error: Error message if fetch failed (content_markdown will have a fallback)
+    """
+    log.info(f"Fetching content: {req.url}")
+    result = await fetch_url_content(req.url, max_chars=req.max_chars)
     return {
-        "batch_id": batch.id,
-        "summary": batch.batch_summary,
-        "item_count": batch.item_count,
-        "next_page_token": next_page,
+        "content_markdown": result.content_markdown,
+        "title": result.title,
+        "word_count": result.word_count,
+        "url": result.url,
+        "error": result.error,
     }
 
 
-# --- Review Queue ---
+# =============================================================================
+# LLM — privacy-first routing (DEPRECATED: workflows now use n8n native nodes)
+# =============================================================================
 
 
-@app.get("/reviews/pending/{account_id}")
-async def get_pending_reviews(
-    account_id: int,
-    session: AsyncSession = Depends(get_session),
-):
-    batches = await get_pending_batches(session, account_id)
-    return [
-        {
-            "id": b.id,
-            "summary": b.batch_summary,
-            "item_count": b.item_count,
-            "created_at": b.created_at.isoformat(),
-        }
-        for b in batches
-    ]
+class AnalyzeRequest(BaseModel):
+    """Send content through the privacy-first LLM pipeline.
+
+    Pass 1: Local model screens for sensitive content.
+    Pass 2: If clean, optionally routes to a cloud model for better analysis.
+    """
+
+    content: str
+    system_prompt: str = ""
+    analysis_prompt: str = ""
+    provider: str | None = None  # force a specific provider, or None for auto-routing
 
 
-@app.get("/reviews/{batch_id}")
-async def get_review(
-    batch_id: int,
-    session: AsyncSession = Depends(get_session),
-):
-    details = await get_batch_details(session, batch_id)
-    if not details:
-        raise HTTPException(404, "Batch not found")
-
-    return {
-        "batch": {
-            "id": details["batch"].id,
-            "summary": details["batch"].batch_summary,
-            "status": details["batch"].status.value,
-            "item_count": details["batch"].item_count,
-        },
-        "actions": [
-            {
-                "action_id": a["action"].id,
-                "action_type": a["action"].action_type.value,
-                "reason": a["action"].reason,
-                "params": a["action"].action_params,
-                "item": {
-                    "title": a["item"].title if a["item"] else "",
-                    "sender": a["item"].sender if a["item"] else "",
-                    "snippet": a["item"].snippet if a["item"] else "",
-                    "category": a["item"].category if a["item"] else "",
-                    "sensitive": a["item"].sensitivity_flag if a["item"] else False,
-                }
-                if a["item"]
-                else None,
-            }
-            for a in details["actions"]
-        ],
-    }
+class AnalyzeResponse(BaseModel):
+    result: str
+    provider_used: str
+    model_used: str
+    kept_local: bool
 
 
-class ApprovalRequest(BaseModel):
-    approved_action_ids: list[int] | None = None  # None = approve all
-    reject_all: bool = False
+@app.post("/llm/analyze", response_model=AnalyzeResponse)
+async def analyze(req: AnalyzeRequest):
+    """Privacy-first content analysis.
 
-
-@app.post("/reviews/{batch_id}/approve")
-async def approve_review(
-    batch_id: int,
-    req: ApprovalRequest,
-    session: AsyncSession = Depends(get_session),
-):
-    """Approve or reject a review batch, then execute approved actions."""
-    batch = await approve_batch(
-        session,
-        batch_id,
-        approved_action_ids=req.approved_action_ids,
-        reject_all=req.reject_all,
+    n8n workflows send email bodies, bookmark content, etc. here.
+    The sidecar screens locally first, then routes to cloud if clean.
+    """
+    screening_prompt = (
+        "Analyze this content for sensitive information. "
+        "Sensitive means: PII (SSN, account numbers, medical info, passwords, "
+        "financial details), or clearly personal/private in nature "
+        "(health, legal, intimate). "
+        "Respond with ONLY the word SENSITIVE or CLEAN.\n\n"
+        "Content:\n{content}"
     )
 
-    if batch.status.value in ("approved", "partial"):
-        # Need Gmail client to execute
-        from services.database import Account
+    analysis_prompt = req.analysis_prompt or (
+        "{content}\n\nAnalyze the above content. Provide a structured JSON response."
+    )
 
-        account = await session.get(Account, batch.account_id)
-        if account and account.google_refresh_token:
-            gmail = GmailClient.from_refresh_token(account.google_refresh_token)
-            summary = await execute_approved_actions(session, batch_id, gmail)
-            return {"batch_status": batch.status.value, "execution": summary}
+    result = await llm_router.screen_then_analyze(
+        content=req.content,
+        screening_prompt=screening_prompt,
+        analysis_prompt=analysis_prompt,
+        analysis_provider=req.provider,
+    )
 
-    return {"batch_status": batch.status.value, "execution": None}
-
-
-# --- Bookmarks ---
-
-
-@app.get("/bookmarks/detect")
-async def detect_bookmarks():
-    """Check if Chrome bookmarks file can be found."""
-    path = find_chrome_bookmarks_path()
-    if path:
-        bookmarks = parse_chrome_bookmarks(path)
-        return {
-            "found": True,
-            "path": str(path),
-            "bookmark_count": len(bookmarks),
-            "sample": [
-                {"title": b.title, "url": b.url, "folder": b.folder} for b in bookmarks[:10]
-            ],
-        }
-    return {"found": False, "path": None, "bookmark_count": 0}
+    return AnalyzeResponse(
+        result=result["analysis"].content,
+        provider_used=result["analysis"].provider,
+        model_used=result["analysis"].model,
+        kept_local=result["kept_local"],
+    )
 
 
-class DigestBookmarksRequest(BaseModel):
-    folder: str = ""  # empty = all bookmarks
-    limit: int = 10
-    since_days: int = 7  # only process bookmarks added in last N days
+class CompletionRequest(BaseModel):
+    """Direct LLM completion — bypass privacy screening."""
+
+    prompt: str
+    system: str = ""
+    provider: str = "ollama"
+    temperature: float = 0.3
+    max_tokens: int = 4096
 
 
-@app.post("/bookmarks/digest")
-async def digest_bookmarks(req: DigestBookmarksRequest):
-    """Fetch and distill bookmarks into summaries."""
-    path = find_chrome_bookmarks_path()
-    if not path:
-        raise HTTPException(400, "Chrome bookmarks not found")
-
-    bookmarks = parse_chrome_bookmarks(path)
-
-    # Filter by folder if specified
-    if req.folder:
-        bookmarks = [b for b in bookmarks if req.folder.lower() in b.folder.lower()]
-
-    # Filter by date if date_added is available
-    from datetime import timedelta
-
-    cutoff = None
-    if req.since_days:
-        from datetime import datetime
-
-        cutoff = datetime.now(UTC) - timedelta(days=req.since_days)
-
-    if cutoff:
-        bookmarks = [b for b in bookmarks if b.date_added and b.date_added >= cutoff]
-
-    bookmarks = bookmarks[: req.limit]
-
-    results = []
-    for bm in bookmarks:
-        digest = await fetch_and_distill(bm)
-        results.append(
-            {
-                "title": digest.bookmark.title,
-                "url": digest.bookmark.url,
-                "summary": digest.summary,
-                "key_takeaways": digest.key_takeaways,
-                "category": digest.category,
-                "tags": digest.suggested_tags,
-                "read_time": digest.read_time_minutes,
-            }
+@app.post("/llm/complete")
+async def complete(req: CompletionRequest):
+    """Direct completion on a specific provider. For when you know what you want."""
+    try:
+        resp = await llm_router.complete(
+            prompt=req.prompt,
+            system=req.system,
+            provider=req.provider,
+            temperature=req.temperature,
+            max_tokens=req.max_tokens,
         )
-
-    return {"count": len(results), "digests": results}
-
-
-# --- LLM Health ---
+        return {"result": resp.content, "provider": resp.provider, "model": resp.model}
+    except Exception as e:
+        raise HTTPException(500, f"LLM completion failed: {e}") from e
 
 
 @app.get("/llm/test")
 async def test_llm(provider: str = "ollama"):
-    """Quick test that an LLM provider is working."""
+    """Quick health check for a specific LLM provider."""
     try:
         resp = await llm_router.complete(
             prompt="Say 'hello' and nothing else.",
@@ -302,3 +194,136 @@ async def test_llm(provider: str = "ollama"):
         return {"provider": provider, "response": resp.content, "model": resp.model}
     except Exception as e:
         raise HTTPException(500, f"LLM test failed: {e}") from e
+
+
+# =============================================================================
+# Bookmarks — Chrome bookmarks file parsing (n8n can't read local files)
+# =============================================================================
+
+
+@app.get("/bookmarks/detect")
+async def detect_bookmarks():
+    """Check if Chrome bookmarks file exists and return stats."""
+    path = find_chrome_bookmarks_path()
+    if path:
+        bookmarks = parse_chrome_bookmarks(path)
+        folders = sorted({b.folder for b in bookmarks if b.folder})
+        return {
+            "found": True,
+            "path": str(path),
+            "bookmark_count": len(bookmarks),
+            "folders": folders,
+            "sample": [{"title": b.title, "url": b.url, "folder": b.folder} for b in bookmarks[:5]],
+        }
+    return {"found": False, "path": None, "bookmark_count": 0}
+
+
+@app.get("/bookmarks/list")
+async def list_bookmarks(
+    folder: str = "",
+    since_days: int = 0,
+    limit: int = 50,
+):
+    """Return bookmarks as JSON for n8n to iterate over.
+
+    n8n's SplitInBatches node can then process each one.
+    """
+    path = find_chrome_bookmarks_path()
+    if not path:
+        raise HTTPException(400, "Chrome bookmarks file not found")
+
+    bookmarks = parse_chrome_bookmarks(path)
+
+    if folder:
+        bookmarks = [b for b in bookmarks if folder.lower() in b.folder.lower()]
+
+    if since_days:
+        cutoff = datetime.now(UTC) - timedelta(days=since_days)
+        bookmarks = [b for b in bookmarks if b.date_added and b.date_added >= cutoff]
+
+    bookmarks = bookmarks[:limit]
+
+    return {
+        "count": len(bookmarks),
+        "bookmarks": [
+            {
+                "title": b.title,
+                "url": b.url,
+                "folder": b.folder,
+                "date_added": b.date_added.isoformat() if b.date_added else None,
+            }
+            for b in bookmarks
+        ],
+    }
+
+
+class DigestRequest(BaseModel):
+    url: str
+    title: str = ""
+
+
+@app.post("/bookmarks/digest")
+async def digest_bookmark(req: DigestRequest):
+    """Fetch a single URL and distill it with an LLM.
+
+    n8n sends one bookmark at a time (from SplitInBatches).
+    """
+    from services.bookmarks.ingester import Bookmark
+
+    bookmark = Bookmark(url=req.url, title=req.title)
+    digest = await fetch_and_distill(bookmark)
+
+    return {
+        "title": digest.bookmark.title,
+        "url": digest.bookmark.url,
+        "summary": digest.summary,
+        "key_takeaways": digest.key_takeaways,
+        "category": digest.category,
+        "suggested_tags": digest.suggested_tags,
+        "read_time_minutes": digest.read_time_minutes,
+        "word_count": digest.word_count,
+    }
+
+
+class IngestRequest(BaseModel):
+    """Incoming bookmark from the Chrome extension or iOS Shortcut.
+
+    The extension POSTs here when a bookmark is created.
+    This endpoint fetches + distills in one shot.
+    """
+
+    url: str
+    title: str = ""
+    folder: str = ""
+
+
+@app.post("/bookmarks/ingest")
+async def ingest_bookmark(req: IngestRequest):
+    """One-shot bookmark ingestion: receive → fetch → distill → return digest.
+
+    Called by:
+    - Chrome extension (chrome.bookmarks.onCreated → POST here)
+    - iOS Shortcut (Share Sheet → POST here)
+    - n8n webhook relay (if you prefer n8n as the entry point)
+
+    Returns the full digest JSON that n8n or any consumer can act on.
+    """
+    from services.bookmarks.ingester import Bookmark
+
+    log.info(f"Ingesting bookmark: {req.title or req.url}")
+
+    bookmark = Bookmark(url=req.url, title=req.title, folder=req.folder)
+    digest = await fetch_and_distill(bookmark)
+
+    return {
+        "status": "ingested",
+        "title": digest.bookmark.title or req.title,
+        "url": digest.bookmark.url,
+        "folder": req.folder,
+        "summary": digest.summary,
+        "key_takeaways": digest.key_takeaways,
+        "category": digest.category,
+        "suggested_tags": digest.suggested_tags,
+        "read_time_minutes": digest.read_time_minutes,
+        "word_count": digest.word_count,
+    }

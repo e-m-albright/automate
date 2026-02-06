@@ -108,29 +108,73 @@ def _walk_bookmark_tree(node: dict, folder: str, out: list[Bookmark]):
                 _walk_bookmark_tree(value, folder, out)
 
 
-async def fetch_and_distill(bookmark: Bookmark) -> DigestedBookmark:
-    """Fetch a bookmarked URL and distill its content with an LLM."""
-    full_text = ""
+@dataclass
+class FetchedContent:
+    """Raw content fetched from a URL — no LLM processing, just clean markdown."""
+
+    url: str
+    title: str = ""
+    content_markdown: str = ""
+    word_count: int = 0
+    error: str = ""
+
+
+async def fetch_url_content(url: str, max_chars: int = 8000) -> FetchedContent:
+    """Fetch a URL and return clean markdown content.
+
+    This is the sidecar's core value-add: BeautifulSoup + markdownify
+    strips boilerplate (nav, footer, scripts, ads) and converts to
+    clean markdown that an LLM can consume.
+
+    n8n calls this via POST /content/fetch. All LLM work (classification,
+    summarization) now happens in n8n's native Ollama/Claude nodes.
+    """
     try:
         async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
             resp = await client.get(
-                bookmark.url, headers={"User-Agent": "Mozilla/5.0 (Automate Bot; content digest)"}
+                url, headers={"User-Agent": "Mozilla/5.0 (Automate Bot; content digest)"}
             )
             resp.raise_for_status()
 
             soup = BeautifulSoup(resp.text, "html.parser")
+
+            # Extract title from <title> tag if present
+            page_title = ""
+            if soup.title and soup.title.string:
+                page_title = soup.title.string.strip()
+
             # Remove scripts, styles, nav, footer
             for tag in soup(["script", "style", "nav", "footer", "header", "aside"]):
                 tag.decompose()
 
-            full_text = markdownify(str(soup), strip=["img", "a"])
-            # Truncate to ~8k chars for LLM context
-            full_text = full_text[:8000]
-    except Exception as e:
-        log.warning(f"Failed to fetch {bookmark.url}: {e}")
-        full_text = f"[Could not fetch content: {e}]"
+            content = markdownify(str(soup), strip=["img", "a"])
+            content = content[:max_chars]
+            word_count = len(content.split())
 
-    word_count = len(full_text.split())
+            return FetchedContent(
+                url=url,
+                title=page_title,
+                content_markdown=content,
+                word_count=word_count,
+            )
+    except Exception as e:
+        log.warning(f"Failed to fetch {url}: {e}")
+        return FetchedContent(
+            url=url,
+            content_markdown=f"[Could not fetch content: {e}]",
+            error=str(e),
+        )
+
+
+async def fetch_and_distill(bookmark: Bookmark) -> DigestedBookmark:
+    """Fetch a bookmarked URL and distill its content with an LLM.
+
+    DEPRECATED: New workflows use fetch_url_content() + n8n LLM nodes instead.
+    Kept for backward compatibility with older workflow JSONs.
+    """
+    fetched = await fetch_url_content(bookmark.url)
+    full_text = fetched.content_markdown
+    word_count = fetched.word_count
 
     # Distill with LLM
     prompt = f"""Analyze this article/page and provide a structured digest.

@@ -1,31 +1,49 @@
 # Automate
 
-Privacy-first email and content automation powered by local LLMs.
+Privacy-first email and content automation, powered by [n8n](https://n8n.io/) and local LLMs.
 
-Automate triages your inbox, distills your bookmarks, and organizes your content — without blasting your personal data to cloud APIs unless you explicitly opt in.
+## What is this?
 
-## How it works
+**n8n is the application.** You build, edit, and monitor all your automations in the n8n visual editor at `http://localhost:5678`. A small Python sidecar handles two things n8n can't do natively: parsing your Chrome bookmarks file and routing LLM calls through a local privacy screen.
 
 ```
-Content Sources          Local LLM (Pass 1)         Cloud LLM (Pass 2, optional)
-─────────────────       ──────────────────────      ────────────────────────────
-Gmail (you)        ──►  Screen for sensitivity  ──► Deep analysis (Claude/Gemini)
-Gmail (wife)       ──►  Classify & categorize   ──► Summarize & draft replies
-Chrome bookmarks   ──►  Extract & distill       ──► Tag & organize
-RSS feeds          ──►                              │
-Photos (future)    ──►                              ▼
-                                                 Review Queue
-                                                    │
-                                          You approve/reject
-                                                    │
-                                                    ▼
-                                              Execute actions
-                                        (label, archive, delete,
-                                         unsubscribe, draft reply,
-                                         publish to Astro blog)
+┌─────────────────────────────────────────────────────┐
+│  n8n  (http://localhost:5678)                       │
+│                                                     │
+│  ┌──────────┐  ┌──────────┐  ┌────────────────┐    │
+│  │ Gmail    │  │ Schedule │  │ Wait for       │    │
+│  │ Trigger  │  │ Trigger  │  │ Approval node  │    │
+│  └────┬─────┘  └────┬─────┘  └────────────────┘    │
+│       │              │                               │
+│       ▼              ▼                               │
+│  ┌──────────────────────────┐                       │
+│  │ HTTP Request to sidecar  │◄── privacy screening  │
+│  │ POST /llm/analyze        │    + LLM routing       │
+│  └──────────────────────────┘                       │
+│       │                                              │
+│       ▼                                              │
+│  ┌──────────────────────────┐                       │
+│  │ Gmail: Label / Archive / │◄── only after you     │
+│  │ Delete / Draft Reply     │    approve in n8n UI   │
+│  └──────────────────────────┘                       │
+└─────────────────────────────────────────────────────┘
+         │
+         ▼
+┌─────────────────┐     ┌──────────────────┐
+│  Sidecar :8000  │────►│  Ollama :11434   │
+│  (Python/Fast   │     │  (local LLM,     │
+│   API)          │────►│   nothing leaves  │
+│                 │     │   your machine)   │
+│  • /llm/analyze │     └──────────────────┘
+│  • /bookmarks/* │              │
+└─────────────────┘              │ (if content is clean)
+                                 ▼
+                        ┌──────────────────┐
+                        │  Claude / Gemini │
+                        │  (optional,      │
+                        │   cloud)         │
+                        └──────────────────┘
 ```
-
-**Nothing destructive happens without your approval.** Every proposed action goes through a review queue where you approve or reject in manageable batches.
 
 ## Quick start
 
@@ -34,173 +52,158 @@ Photos (future)    ──►                              ▼
 # Install uv:  curl -LsSf https://astral.sh/uv/install.sh | sh
 # Install just: brew install just
 
-# Clone and setup
-just setup
-
-# Or step by step:
-cp .env.example .env          # add your API keys
-just sync                      # install Python deps
-just up                        # start n8n + API + Ollama
-just pull-model                # download Qwen 2.5 7B (~4GB)
+just setup         # install Python deps, create .env
+just up            # start n8n + sidecar + Ollama
+just pull-model    # download Qwen 2.5 7B (~4GB)
+just open          # open n8n in your browser
 ```
+
+Then build your workflows in the n8n UI.
 
 ## Services
 
-| Service | URL | Purpose |
-|---------|-----|---------|
-| API | http://localhost:8000 | FastAPI backend — all processing logic |
-| API docs | http://localhost:8000/docs | Interactive Swagger UI |
-| n8n | http://localhost:5678 | Workflow automation & scheduling |
-| Ollama | http://localhost:11434 | Local LLM inference |
+| Service | URL | What it does |
+|---------|-----|-------------|
+| **n8n** | http://localhost:5678 | Your main UI — build workflows, connect Gmail, approve actions |
+| **Sidecar** | http://localhost:8000 | Bookmark parsing + LLM privacy routing (called by n8n) |
+| **Sidecar docs** | http://localhost:8000/docs | API reference for the sidecar endpoints |
+| **Ollama** | http://localhost:11434 | Local LLM inference |
+
+## Building workflows in n8n
+
+n8n is a visual workflow builder. You drag nodes, connect them, and they run on a schedule or trigger. Here's how to build each automation:
+
+### Email triage
+
+1. **Gmail Trigger** node → fires on new emails (or use Schedule Trigger to batch process)
+2. **HTTP Request** node → `POST http://sidecar:8000/llm/analyze` with the email body
+   - The sidecar screens for sensitive content locally, then classifies
+3. **Switch** node → route by category (junk, newsletter, actionable, etc.)
+4. **Wait for Approval** node → you review proposed actions in the n8n UI
+5. **Gmail** node → label, archive, delete, or draft a reply
+
+### Bookmark digestion
+
+1. **Schedule Trigger** → runs daily
+2. **HTTP Request** → `GET http://sidecar:8000/bookmarks/list?since_days=1`
+3. **SplitInBatches** → process each bookmark
+4. **HTTP Request** → `POST http://sidecar:8000/bookmarks/digest` with each URL
+5. Do what you want with the summary (email it, save to file, push to your blog)
+
+### Inbox cleanup (for your wife's 1000s of old emails)
+
+1. **Manual Trigger** (or Schedule) → kicks off a batch
+2. **Gmail** node → search `is:inbox older_than:30d`, limit to 50
+3. **SplitInBatches** → process each email
+4. **HTTP Request** → `POST http://sidecar:8000/llm/analyze` for each
+5. **Wait for Approval** → batch review in the n8n UI
+6. **Gmail** → archive junk, unsubscribe from newsletters, label the rest
+
+### Key n8n concepts
+
+- **Gmail node**: Connect your Google account in n8n's credentials UI (Settings → Credentials). Handles OAuth for you.
+- **Wait for Approval**: Pauses the workflow and shows you a review in the n8n UI. Nothing happens until you click approve.
+- **HTTP Request node**: Calls the sidecar. Use `http://sidecar:8000` (Docker container name).
+- **Error Trigger**: Add one to catch failures and notify you.
+
+## Privacy model
+
+Every piece of content goes through a two-pass system:
+
+1. **Pass 1 (always local):** Ollama screens for sensitive content (PII, financial, medical). Nothing leaves your machine.
+2. **Pass 2 (configurable):** Clean content can route to Claude/Gemini for better analysis. Sensitive content stays local.
+
+```bash
+# .env — control the routing
+DEFAULT_PROVIDER=ollama                    # everything local by default
+HIGH_QUALITY_PROVIDER=claude               # route clean content here
+CLAUDE_API_KEY=sk-ant-...                  # optional
+```
+
+## Sidecar API
+
+The sidecar only does two things:
+
+### LLM routing
+
+```bash
+# Privacy-first analysis (screens locally, then routes)
+curl -X POST http://localhost:8000/llm/analyze \
+  -H "Content-Type: application/json" \
+  -d '{"content": "...", "analysis_prompt": "Classify this email..."}'
+
+# Direct completion (bypass screening)
+curl -X POST http://localhost:8000/llm/complete \
+  -H "Content-Type: application/json" \
+  -d '{"prompt": "Summarize this article...", "provider": "ollama"}'
+```
+
+### Bookmark parsing
+
+```bash
+# Detect Chrome bookmarks
+curl http://localhost:8000/bookmarks/detect
+
+# List recent bookmarks
+curl "http://localhost:8000/bookmarks/list?since_days=7&limit=20"
+
+# Digest a single URL
+curl -X POST http://localhost:8000/bookmarks/digest \
+  -H "Content-Type: application/json" \
+  -d '{"url": "https://example.com/article", "title": "Some Article"}'
+```
 
 ## Common commands
 
 ```bash
-just --list        # see all available commands
+just --list        # see everything
 
-# Development
-just dev           # run API locally (hot reload, no Docker)
+just up            # start all services
+just open          # open n8n in browser
+just logs          # follow all logs
+just log n8n       # follow n8n logs only
+just status        # check everything
+
+just pull-model    # download default LLM
+just chat          # chat with local model
+just llm-test      # test LLM health
+
 just check         # lint + format check
 just fix           # auto-fix lint issues
-just fmt           # format code
 just test          # run tests
-
-# Docker
-just up            # start all services
-just down          # stop all services
-just logs          # follow all logs
-just log api       # follow API logs only
-just rebuild       # rebuild API container after code changes
-
-# Local LLM
-just pull-model    # pull default model (qwen2.5:7b)
-just pull-vision   # pull vision model for future photo analysis
-just models        # list downloaded models
-just chat          # interactive chat with local model
-
-# Status
-just status        # health check everything
-just llm-test      # test LLM provider
+just clean         # remove caches
 ```
-
-## Architecture
-
-### Privacy-first LLM routing
-
-Every piece of content runs through a two-pass system:
-
-1. **Pass 1 (always local):** Ollama with Qwen 2.5 screens for sensitive content (PII, financial, medical, personal). Nothing leaves your machine.
-2. **Pass 2 (configurable):** Clean content can optionally route to Claude, Gemini, or OpenAI for higher-quality analysis. Sensitive content stays local.
-
-You control routing per-task in `.env`:
-
-```bash
-# Default: everything stays local
-DEFAULT_PROVIDER=ollama
-
-# Or route clean content to Claude for better quality
-HIGH_QUALITY_PROVIDER=claude
-CLAUDE_API_KEY=sk-ant-...
-```
-
-### Supported LLM providers
-
-| Provider | Best for | Privacy |
-|----------|----------|---------|
-| **Ollama** (local) | Screening, classification, basic summarization | Full — nothing leaves your machine |
-| **Claude** | Deep analysis, reply drafting, nuanced categorization | Cloud — only non-sensitive content |
-| **Gemini** | YouTube video summarization, multimodal | Cloud — only non-sensitive content |
-
-### Recommended local models
-
-| Model | Parameters | VRAM | Use case |
-|-------|-----------|------|----------|
-| Qwen 2.5 7B | 7B | ~6GB | Default — email triage, classification |
-| Qwen 2.5 32B | 32B | ~20GB | Higher quality, if you have an RTX 4090 or 32GB Mac |
-| Qwen 2.5 VL 7B | 7B | ~8GB | Future — photo/image analysis |
 
 ## Project structure
 
 ```
 automate/
-├── main.py                     # FastAPI app — all API endpoints
+├── docker-compose.yml          # n8n + sidecar + Ollama
+├── main.py                     # Sidecar API (bookmarks + LLM routing)
+├── Dockerfile                  # Sidecar container
 ├── config/
-│   └── settings.py             # Pydantic settings, LLM/Gmail config
+│   ├── settings.py             # Sidecar config (LLM providers, etc.)
+│   ├── cloudflare-tunnel.yml   # Deployment config
+│   └── deploy.md               # Deployment guide
 ├── services/
 │   ├── llm/                    # Multi-provider LLM router
-│   │   ├── router.py           #   Privacy-first screen-then-analyze
+│   │   ├── router.py           #   Privacy-first screen → analyze
 │   │   └── providers/          #   Ollama, Claude, Gemini
-│   ├── gmail/                  # Gmail integration
-│   │   ├── client.py           #   API client (read + write operations)
-│   │   └── classifier.py       #   AI email classification
-│   ├── review/                 # Approval workflow
-│   │   └── queue.py            #   Batch proposals, approve/reject
-│   ├── actions/                # Post-approval execution
-│   │   └── executor.py         #   Label, archive, delete, unsubscribe, draft
-│   ├── bookmarks/              # Chrome bookmark digestion
-│   │   └── ingester.py         #   Parse, fetch, summarize
-│   ├── content/                # Content publishing
-│   │   └── astro_publisher.py  #   Push digests to Astro blog
-│   ├── photos_stub/            # Future: Google Photos / iCloud
-│   │   └── watcher.py          #   Architecture documented, not yet built
-│   └── database.py             # SQLAlchemy models
-├── n8n/workflows/              # n8n workflow templates
-├── docker-compose.yml          # n8n + API + Ollama
-├── pyproject.toml              # Dependencies, ruff, pytest config
-└── justfile                    # Task runner recipes
-```
-
-## Email pipeline
-
-```
-1. Fetch batch (50 emails)
-2. Screen each for sensitivity (local LLM)
-3. Classify: junk, newsletter, receipt, social, actionable, FYI, personal, important
-4. Propose actions: archive, delete, unsubscribe, label, draft reply
-5. Create review batch (you see a summary)
-6. You approve/reject per-item or in bulk
-7. Execute approved actions in Gmail
-```
-
-## Bookmark pipeline
-
-```
-1. Read Chrome's local Bookmarks file (no extension needed)
-2. Fetch each URL, extract article content
-3. Distill with LLM: summary, key takeaways, category, tags
-4. Publish as markdown to your Astro blog
-```
-
-## Configuration
-
-Copy `.env.example` to `.env` and fill in what you need:
-
-```bash
-# Required for Gmail
-GOOGLE_CLIENT_ID=...
-GOOGLE_CLIENT_SECRET=...
-
-# Optional — cloud LLM providers (local Ollama works without these)
-CLAUDE_API_KEY=...
-GEMINI_API_KEY=...
-
-# Processing
-EMAIL_BATCH_SIZE=50            # emails per review batch
+│   └── bookmarks/
+│       └── ingester.py         #   Chrome bookmark parser + URL distiller
+├── pyproject.toml              # Deps, ruff, pytest config
+└── justfile                    # Task runner
 ```
 
 ## Deployment
 
 **Local** (current): Docker Compose on your machine.
 
-**Always-on**: Small VPS ($5/mo) with Cloudflare Tunnel. See `config/deploy.md`.
-
-```bash
-just tunnel    # start Cloudflare Tunnel
-```
+**Always-on**: Small VPS ($5/mo) with Cloudflare Tunnel for n8n access from anywhere. See `config/deploy.md`.
 
 ## Future plans
 
-- **Photo analysis**: Point at Google Photos or iCloud, detect scenes (e.g., thumbs-up at a bookshelf → scan for book titles → look up reviews)
-- **RSS/site monitoring**: Watch publications, alert on new content matching your interests
-- **Reflex dashboard**: Full review UI beyond the API
+- **Photo analysis**: Watch Google Photos / iCloud → detect scenes → extract info
+- **RSS monitoring**: Watch sites and publications for new content
+- **Astro blog integration**: Push digested content to your journal
 - **Text/SMS ingestion**: Process incoming messages through the same pipeline

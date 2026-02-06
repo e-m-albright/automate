@@ -1,0 +1,18 @@
+{
+  "manifest_version": 3,
+  "name": "Automate Bookmark Sync",
+  "version": "1.0.0",
+  "description": "Sends new bookmarks to your Automate sidecar for digestion.",
+  "permissions": ["bookmarks", "storage"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "options_ui": {
+    "page": "options.html",
+    "open_in_tab": false
+  },
+  "icons": {
+    "48": "icon48.png",
+    "128": "icon128.png"
+  }
+}

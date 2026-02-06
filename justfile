@@ -1,9 +1,12 @@
 # ============================================================================
-# Automate — Privacy-first email & content automation
+# Automate — n8n + privacy-first LLM sidecar
 # ============================================================================
 #
+# n8n is the main app — build workflows at http://localhost:5678
+# The sidecar handles bookmark parsing & LLM privacy routing.
+#
 # Usage:  just <recipe>
-#         just --list          show all recipes
+#         just --list
 #
 # Requires: uv, docker, just
 # ============================================================================
@@ -17,7 +20,7 @@ default_model := "qwen2.5:7b"
 # Setup
 # ---------------------------------------------------------------------------
 
-# First-time project setup — install deps, create .env, pull LLM model
+# First-time project setup — install deps, create .env
 setup: _ensure-uv
     @echo "▸ Installing Python dependencies..."
     uv sync --all-extras
@@ -27,50 +30,48 @@ setup: _ensure-uv
     fi
     @echo ""
     @echo "✓ Setup complete. Next:"
-    @echo "  just up          start all services"
+    @echo "  just up          start n8n + sidecar + ollama"
     @echo "  just pull-model  download the local LLM"
+    @echo "  just open        open n8n in your browser"
 
 # Install/update all Python deps
 sync: _ensure-uv
     uv sync --all-extras
 
 # ---------------------------------------------------------------------------
-# Development
+# Running
 # ---------------------------------------------------------------------------
 
-# Start the FastAPI server locally (no Docker)
+# Start everything (n8n + sidecar + Ollama)
+up *args:
+    docker compose up -d {{args}}
+
+# Stop everything
+down:
+    docker compose down
+
+# Restart everything
+restart:
+    docker compose restart
+
+# Open n8n in your browser
+open:
+    @echo "Opening n8n at http://localhost:5678..."
+    @open http://localhost:5678 2>/dev/null || xdg-open http://localhost:5678
+
+# Start the sidecar locally for development (no Docker)
 dev:
     uv run uvicorn main:app --reload --host 0.0.0.0 --port 8000
 
-# Open the API docs in your browser
+# Open the sidecar API docs
 docs:
-    open http://localhost:8000/docs 2>/dev/null || xdg-open http://localhost:8000/docs
-
-# Run a quick LLM health check
-llm-test provider="ollama":
-    @curl -s http://localhost:8000/llm/test?provider={{provider}} | python3 -m json.tool
-
-# Detect Chrome bookmarks on this machine
-bookmarks-detect:
-    @curl -s http://localhost:8000/bookmarks/detect | python3 -m json.tool
+    @open http://localhost:8000/docs 2>/dev/null || xdg-open http://localhost:8000/docs
 
 # ---------------------------------------------------------------------------
 # Docker
 # ---------------------------------------------------------------------------
 
-# Start all services (n8n + API + Ollama)
-up *args:
-    docker compose up -d {{args}}
-
-# Stop all services
-down:
-    docker compose down
-
-# Restart all services
-restart:
-    docker compose restart
-
-# Show logs (follow mode)
+# Show logs (follow mode) — all services or specify one
 logs *args:
     docker compose logs -f {{args}}
 
@@ -78,10 +79,10 @@ logs *args:
 log service:
     docker compose logs -f {{service}}
 
-# Rebuild the API container after code changes
+# Rebuild the sidecar container after code changes
 rebuild:
-    docker compose build api
-    docker compose up -d api
+    docker compose build sidecar
+    docker compose up -d sidecar
 
 # Full nuke and rebuild (keeps volumes)
 rebuild-all:
@@ -108,6 +109,22 @@ models:
 # Chat with the local model (interactive)
 chat model=default_model:
     docker exec -it automate-ollama ollama run {{model}}
+
+# ---------------------------------------------------------------------------
+# Sidecar utilities
+# ---------------------------------------------------------------------------
+
+# Quick LLM health check via the sidecar
+llm-test provider="ollama":
+    @curl -s http://localhost:8000/llm/test?provider={{provider}} | python3 -m json.tool
+
+# Detect Chrome bookmarks on this machine
+bookmarks-detect:
+    @curl -s http://localhost:8000/bookmarks/detect | python3 -m json.tool
+
+# List recent bookmarks
+bookmarks-list days="7" limit="20":
+    @curl -s "http://localhost:8000/bookmarks/list?since_days={{days}}&limit={{limit}}" | python3 -m json.tool
 
 # ---------------------------------------------------------------------------
 # Linting & formatting
@@ -145,16 +162,6 @@ test-cov:
     uv run pytest --cov=services --cov=config --cov-report=term-missing
 
 # ---------------------------------------------------------------------------
-# Database
-# ---------------------------------------------------------------------------
-
-# Reset the local database (careful!)
-[confirm("This will delete the local database. Continue?")]
-db-reset:
-    rm -f data/automate.db
-    @echo "▸ Database deleted. It will be recreated on next API start."
-
-# ---------------------------------------------------------------------------
 # Deployment
 # ---------------------------------------------------------------------------
 
@@ -181,9 +188,10 @@ tree:
         -not -path './.git/*' \
         -not -path './.venv/*' \
         -not -path './__pycache__/*' \
-        -not -path './node_modules/*' \
+        -not -path './.ruff_cache/*' \
         -not -name '*.pyc' \
         -not -name '.DS_Store' \
+        -not -name 'uv.lock' \
         | sort
 
 # Show status of all services
@@ -191,7 +199,10 @@ status:
     @echo "▸ Docker containers:"
     @docker compose ps 2>/dev/null || echo "  (not running)"
     @echo ""
-    @echo "▸ API health:"
+    @echo "▸ n8n:      http://localhost:5678"
+    @echo "▸ Sidecar:  http://localhost:8000/docs"
+    @echo ""
+    @echo "▸ Sidecar health:"
     @curl -s http://localhost:8000/health 2>/dev/null | python3 -m json.tool || echo "  (not reachable)"
     @echo ""
     @echo "▸ Ollama models:"
