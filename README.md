@@ -2,17 +2,13 @@
 
 Email and content automation with [n8n](https://n8n.io/) and [Ollama](https://ollama.com/) for local LLM.
 
-## TODO
-
-- Create gmail label id strip + lookup dict
-- webhookid mask too
-
 ## Quick start
 
 ```bash
 just setup    # create .env, turn on services
 just up       # after the initial setup, turn on services this way
 just open     # open n8n at http://localhost:5678
+just import-workflows
 ```
 
 **Services:** n8n at `http://localhost:5678`, Ollama at `http://localhost:11434`. Use the Ollama node in n8n with base URL `http://ollama:11434` when running in Docker.
