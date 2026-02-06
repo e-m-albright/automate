@@ -99,6 +99,10 @@ chat model=default_model:
 export-workflows:
     @scripts/export-workflows.sh
 
+# Import workflow JSON files from n8n/workflows/ into n8n
+import-workflows:
+    @scripts/import-workflows.sh
+
 # ---------------------------------------------------------------------------
 # Housekeeping
 # ---------------------------------------------------------------------------

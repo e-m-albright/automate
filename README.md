@@ -1,103 +1,51 @@
 # Automate
 
-Privacy-first email and content automation, powered by [n8n](https://n8n.io/) and local LLMs via [Ollama](https://ollama.com/).
-
-## What is this?
-
-**n8n is the application.** You build, edit, and monitor all your automations in the n8n visual editor at `http://localhost:5678`. Workflows use **Ollama** for local LLM inference — nothing leaves your machine unless you add cloud nodes (e.g. Claude, Gemini) yourself.
-
-```
-┌─────────────────────────────────────────────────────┐
-│  n8n  (http://localhost:5678)                       │
-│                                                     │
-│  ┌──────────┐  ┌──────────┐  ┌────────────────┐    │
-│  │ Gmail    │  │ Schedule │  │ Wait for       │    │
-│  │ Trigger  │  │ Trigger  │  │ Approval node  │    │
-│  └────┬─────┘  └────┬─────┘  └────────────────┘    │
-│       │              │                               │
-│       ▼              ▼                               │
-│  ┌──────────────────────────┐                       │
-│  │ Ollama / HTTP Request   │   Local LLM or       │
-│  │ (classify, summarize)   │   direct Ollama API   │
-│  └──────────────────────────┘                       │
-│       │                                              │
-│       ▼                                              │
-│  ┌──────────────────────────┐                       │
-│  │ Gmail: Label / Archive / │                       │
-│  │ Delete / Draft Reply     │                       │
-│  └──────────────────────────┘                       │
-└─────────────────────────────────────────────────────┘
-         │
-         ▼
-┌──────────────────┐
-│  Ollama :11434   │  Local LLM (qwen2.5, llama3.2, etc.)
-└──────────────────┘
-```
+Email and content automation with [n8n](https://n8n.io/) and [Ollama](https://ollama.com/) for local LLM.
 
 ## Quick start
 
 ```bash
-# Prerequisites: docker, just
-# Install just: brew install just
-
-just setup         # create .env, start services
-just up            # start n8n + Ollama
-just pull-model    # download default LLM (qwen2.5:7b)
-just open          # open n8n in your browser
+just setup    # create .env, turn on services
+just up       # after the initial setup, turn on services this way
+just open     # open n8n at http://localhost:5678
 ```
 
-Then build your workflows in the n8n UI.
+**Services:** n8n at `http://localhost:5678`, Ollama at `http://localhost:11434`. Use the Ollama node in n8n with base URL `http://ollama:11434` when running in Docker.
 
-## Services
+You'll need to configure your gmail / gemini / ollama as you desire to enable the automations.
 
-| Service | URL | What it does |
-|---------|-----|-------------|
-| **n8n** | http://localhost:5678 | Your main UI — build workflows, connect Gmail, approve actions |
-| **Ollama** | http://localhost:11434 | Local LLM inference |
+[Check this for gemini pricing.](https://ai.google.dev/gemini-api/docs/pricing)
 
-## Building workflows in n8n
+## Commands
 
-n8n is a visual workflow builder. Use **Ollama** nodes or **HTTP Request** to `http://ollama:11434` (from inside Docker) or `http://localhost:11434` (from your machine) for chat/completions.
 
-### Key n8n concepts
+| Command                        | Description                                         |
+| ------------------------------ | --------------------------------------------------- |
+| `just up` / `down` / `restart` | Start, stop, or restart containers                  |
+| `just open`                    | Open n8n in the browser                             |
+| `just logs` / `just log n8n`   | Follow logs                                         |
+| `just status`                  | Show containers and Ollama models                   |
+| `just pull-model`              | Pull default Ollama model (qwen2.5:7b)              |
+| `just export-workflows`        | Export n8n workflows to `n8n/workflows/`            |
+| `just import-workflows`        | Import workflow JSON from `n8n/workflows/` into n8n |
 
-- **Gmail node**: Connect your Google account in n8n's credentials UI (Settings → Credentials). Handles OAuth for you.
-- **Wait for Approval**: Pauses the workflow and shows you a review in the n8n UI.
-- **Ollama node**: Use the built-in Ollama node with base URL `http://ollama:11434` when n8n runs in Docker.
-- **HTTP Request**: For custom prompts, POST to `http://ollama:11434/api/chat` with `model`, `messages`, `stream: false`.
 
-## Common commands
-
-```bash
-just --list        # see everything
-
-just up            # start all services
-just open         # open n8n in browser
-just logs         # follow all logs
-just log n8n      # follow n8n logs only
-just status       # check everything
-
-just pull-model   # download default LLM
-just chat         # chat with local model
-just models       # list Ollama models
-```
+Set `N8N_API_KEY` in `.env` (create at n8n → Settings → API) for export/import.
 
 ## Project structure
 
 ```
 automate/
 ├── docker-compose.yml   # n8n + Ollama
-├── justfile             # Task runner
-├── n8n/
-│   └── workflows/       # Exported n8n workflow JSONs
+├── justfile
+├── n8n/workflows/       # Version-controlled workflow JSON
 ├── scripts/
-│   ├── setup.sh         # First-time setup
-│   └── export-workflows.sh
-└── .env.example         # Copy to .env and edit
+│   ├── setup.sh
+│   ├── export-workflows.sh
+│   └── import-workflows.sh
+└── .env.example
 ```
 
 ## Deployment
 
-**Local**: Docker Compose on your machine (current).
-
-**Always-on**: Run the same stack on a VPS and expose n8n via Cloudflare Tunnel or similar.
+Run locally with Docker Compose. For always-on access, run the same stack on a VPS and expose n8n (e.g. Cloudflare Tunnel).

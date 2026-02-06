@@ -35,9 +35,6 @@ echo ""
 echo "Waiting for Ollama to be ready..."
 sleep 5
 
-echo "Pulling default model (qwen2.5:7b)..."
-docker exec automate-ollama ollama pull qwen2.5:7b
-
 echo "Pulling default model (llama3.2)..."
 docker exec automate-ollama ollama pull llama3.2
 
