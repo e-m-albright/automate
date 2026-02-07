@@ -1,0 +1,469 @@
+{
+  "id": "e0vcY_9yGvQbABiZQrzvX",
+  "name": "Inbox Organizer",
+  "active": false,
+  "nodes": [
+    {
+      "parameters": {
+        "fieldsToAggregate": {
+          "fieldToAggregate": [
+            {
+              "fieldToAggregate": "name"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.aggregate",
+      "typeVersion": 1,
+      "position": [
+        384,
+        -696
+      ],
+      "id": "ca02cb57-af5a-4cf1-a8d2-dd0d5ba9f509",
+      "name": "Aggregate"
+    },
+    {
+      "parameters": {
+        "resource": "label",
+        "returnAll": true
+      },
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.2,
+      "position": [
+        -288,
+        -696
+      ],
+      "id": "cb37f2b5-8e3d-4e79-8856-1b7288b48972",
+      "name": "Get All Current Labels",
+      "webhookId": "235dafd8-b5b2-4bc5-9983-2640a32e6567"
+    },
+    {
+      "parameters": {
+        "sortFieldsUi": {
+          "sortField": [
+            {
+              "fieldName": "name"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.sort",
+      "typeVersion": 1,
+      "position": [
+        160,
+        -696
+      ],
+      "id": "dcd8b9ee-d475-4d4b-a13a-a547baf1ca09",
+      "name": "Sort"
+    },
+    {
+      "parameters": {
+        "modelId": {
+          "__rl": true,
+          "value": "models/gemini-3-flash-preview",
+          "mode": "list",
+          "cachedResultName": "models/gemini-3-flash-preview"
+        },
+        "messages": {
+          "values": [
+            {
+              "content": "=You are an expert email classifier. Your goal is to route emails to the correct category based on the provided list.\n\n### INPUT DATA\n**From:** {{ $('Email').item.json.from }}\n**Subject:** {{ $('Email').item.json.subject }}\n**Content:** {{ $('Email').item.json.preview }}\n\n### VALID LABELS\n- {{ $('Aggregate').first().json.name.join('\\n- ') }}\n\n### INSTRUCTIONS\n1. **Analyze:** Read the sender, subject, and content.\n2. **Match:** Select the *single* most appropriate label from the \"VALID LABELS\" list.\n3. **Output:** Return **ONLY** the exact label name.\n   - Do not include reasoning.\n   - Do not include markdown formatting (like bolding or backticks).\n   - Do not include the word \"Label:\".\n   - If no label matches perfectly, return \"INBOX\".\n\n### EXAMPLE OUTPUT\nContent/Newsletter"
+            }
+          ]
+        },
+        "builtInTools": {},
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.googleGemini",
+      "typeVersion": 1.1,
+      "position": [
+        832,
+        -432
+      ],
+      "id": "b476de1b-7367-49aa-b0f0-bc7afc0750aa",
+      "name": "Classify"
+    },
+    {
+      "parameters": {
+        "operation": "addLabels",
+        "messageId": "={{ $json.msg_id }}",
+        "labelIds": "={{ [$json.label_id,\"Label_3690428769571063072\"] }}"
+      },
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.2,
+      "position": [
+        1408,
+        -432
+      ],
+      "id": "ade218b4-bfd7-4ec2-bb0c-b8d340548851",
+      "name": "Add Label",
+      "webhookId": "e7dea26f-1c69-47fd-b7e1-2664c82f5361"
+    },
+    {
+      "parameters": {
+        "jsCode": "// 1. Get all labels (Static, so we fetch them once for the whole batch)\nconst allLabels = $('Get All Current Labels').all().map(item => item.json);\n\n// 2. Iterate over \"items\" (The default variable containing your batch of results from Classify)\nreturn items.map((item, index) => {\n  try {\n    // A. Get the LLM text for THIS specific item\n    // We access the current 'item' in the loop, not the global .first()\n    const llmLabelName = item.json.content.parts[0].text.trim();\n\n    // B. Get the Message ID for THIS specific item\n    // We look back at the 'Merge' node results.\n    // By using [index], we ensure we grab the ID that corresponds to this specific execution.\n    const msgId = $('Merge').all()[index].json.id; \n\n    // C. Find the matching Label ID\n    const matchedLabel = allLabels.find(l => l.name === llmLabelName);\n\n    if (!matchedLabel) {\n       // Optional: Log it but don't crash the whole batch\n       return { json: { error: `Label not found: ${llmLabelName}`, msg_id: msgId } };\n    }\n\n    return {\n      json: {\n        msg_id: msgId,\n        label_id: matchedLabel.id,\n        // Optional: Helpful to keep this for debugging if something goes wrong\n        applied_label_name: llmLabelName\n      }\n    };\n    \n  } catch (error) {\n    // If one email fails (e.g. LLM returned bad JSON), this ensures the other 49 still process\n    return {\n      json: {\n        error: error.message,\n        item_index: index\n      }\n    };\n  }\n});"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1184,
+        -432
+      ],
+      "id": "25788261-1812-4e9b-8190-a5c948d71afe",
+      "name": "Match Msg ID / Label ID"
+    },
+    {
+      "parameters": {
+        "operation": "getAll",
+        "filters": {
+          "q": "=-label:z_n8n_processed"
+        }
+      },
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.2,
+      "position": [
+        -288,
+        -504
+      ],
+      "id": "a3b3d938-fba8-4a50-a5b1-8fa6c1f50d2c",
+      "name": "Get Unprocessed Messages",
+      "webhookId": "e35197b9-dd89-4701-b955-ac21b05551ec"
+    },
+    {
+      "parameters": {
+        "operation": "getAll",
+        "filters": {
+          "labelIds": [
+            "Label_4258084874429022502"
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.2,
+      "position": [
+        -288,
+        -312
+      ],
+      "id": "8191d0fe-05d6-4d7e-9b6f-d04bc52f4a7b",
+      "name": "Get Requested Messages",
+      "webhookId": "e35197b9-dd89-4701-b955-ac21b05551ec"
+    },
+    {
+      "parameters": {
+        "pollTimes": {
+          "item": [
+            {
+              "mode": "everyMinute"
+            }
+          ]
+        },
+        "filters": {}
+      },
+      "type": "n8n-nodes-base.gmailTrigger",
+      "typeVersion": 1.3,
+      "position": [
+        -512,
+        -144
+      ],
+      "id": "d599369b-5361-4dde-9892-0eba7c3c13e8",
+      "name": "Message Received Poll"
+    },
+    {
+      "parameters": {
+        "mode": "raw",
+        "jsonOutput": "={\n  \"id\": \"{{ $json.id }}\",\n  \"from\": \"{{ $json.From }}\",\n  \"to\": \"{{ $json.To }}\",\n  \"subject\": \"{{ $json.Subject }}\",\n  \"preview\": \"{{ $json.snippet }}\",\n}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -64,
+        -240
+      ],
+      "id": "a23124c4-f737-4b7f-9fdb-4b4bdf36b7ec",
+      "name": "Email"
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "hours"
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.3,
+      "position": [
+        -512,
+        -720
+      ],
+      "id": "c59c8b6e-8a35-492e-83b7-925542b48de1",
+      "name": "Unprocessed Messages"
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "hours",
+              "triggerAtMinute": 30
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.3,
+      "position": [
+        -512,
+        -480
+      ],
+      "id": "0fe0a19d-8e9c-4f85-998a-345c4610ece0",
+      "name": "Requested Messages"
+    },
+    {
+      "parameters": {
+        "mode": "combine",
+        "combineBy": "combineAll",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3.2,
+      "position": [
+        608,
+        -432
+      ],
+      "id": "c22def1e-c5bd-416a-8738-a2d56ddaf1db",
+      "name": "Merge"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "6ea2c9bc-acf0-4579-be7a-edee3116a442",
+              "leftValue": "={{ $json.name }}",
+              "rightValue": "CHAT|INBOX|SENT|IMPORTANT|TRASH|DRAFT|SPAM|CATEGORY_FORUMS|CATEGORY_UPDATES|CATEGORY_PERSONAL|CATEGORY_PROMOTIONS|CATEGORY_SOCIAL|YELLOW_STAR|STARRED|UNREAD",
+              "operator": {
+                "type": "string",
+                "operation": "notRegex"
+              }
+            },
+            {
+              "id": "2c0add22-d685-4894-8311-5e2f9564d155",
+              "leftValue": "={{ $json.name }}",
+              "rightValue": "smart_label_root_name|Notes",
+              "operator": {
+                "type": "string",
+                "operation": "notRegex"
+              }
+            },
+            {
+              "id": "6a48f444-6c94-4ce2-b90c-9942b64c58dd",
+              "leftValue": "={{ $json.name }}",
+              "rightValue": "\\w+/\\w+",
+              "operator": {
+                "type": "string",
+                "operation": "regex"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.filter",
+      "typeVersion": 2.3,
+      "position": [
+        -64,
+        -696
+      ],
+      "id": "3a101383-39a3-4e56-a980-8a48350bcd10",
+      "name": "Filter Labels"
+    }
+  ],
+  "connections": {
+    "Aggregate": {
+      "main": [
+        [
+          {
+            "node": "Merge",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get All Current Labels": {
+      "main": [
+        [
+          {
+            "node": "Filter Labels",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sort": {
+      "main": [
+        [
+          {
+            "node": "Aggregate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Classify": {
+      "main": [
+        [
+          {
+            "node": "Match Msg ID / Label ID",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Match Msg ID / Label ID": {
+      "main": [
+        [
+          {
+            "node": "Add Label",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Unprocessed Messages": {
+      "main": [
+        [
+          {
+            "node": "Email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Requested Messages": {
+      "main": [
+        [
+          {
+            "node": "Email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Message Received Poll": {
+      "main": [
+        [
+          {
+            "node": "Email",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Get All Current Labels",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Add Label": {
+      "main": [
+        []
+      ]
+    },
+    "Email": {
+      "main": [
+        [
+          {
+            "node": "Merge",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Unprocessed Messages": {
+      "main": [
+        [
+          {
+            "node": "Get Unprocessed Messages",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Get All Current Labels",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Requested Messages": {
+      "main": [
+        [
+          {
+            "node": "Get Requested Messages",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Get All Current Labels",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge": {
+      "main": [
+        [
+          {
+            "node": "Classify",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Filter Labels": {
+      "main": [
+        [
+          {
+            "node": "Sort",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "availableInMCP": false
+  },
+  "pinData": {},
+  "meta": {
+    "templateCredsSetupCompleted": true
+  },
+  "tags": []
+}

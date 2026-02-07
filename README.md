@@ -17,6 +17,8 @@ You'll need to configure your gmail / gemini / ollama as you desire to enable th
 
 [Check this for gemini pricing.](https://ai.google.dev/gemini-api/docs/pricing)
 
+Finally, publish the workflows and all should be running.
+
 ## Commands
 
 
