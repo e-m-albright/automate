@@ -18,7 +18,7 @@
       "typeVersion": 1,
       "position": [
         384,
-        -696
+        -704
       ],
       "id": "ca02cb57-af5a-4cf1-a8d2-dd0d5ba9f509",
       "name": "Aggregate"
@@ -32,7 +32,7 @@
       "typeVersion": 2.2,
       "position": [
         -288,
-        -696
+        -704
       ],
       "id": "cb37f2b5-8e3d-4e79-8856-1b7288b48972",
       "name": "Get All Current Labels",
@@ -53,7 +53,7 @@
       "typeVersion": 1,
       "position": [
         160,
-        -696
+        -704
       ],
       "id": "dcd8b9ee-d475-4d4b-a13a-a547baf1ca09",
       "name": "Sort"
@@ -87,22 +87,6 @@
     },
     {
       "parameters": {
-        "operation": "addLabels",
-        "messageId": "={{ $json.msg_id }}",
-        "labelIds": "={{ [$json.label_id,\"Label_3690428769571063072\"] }}"
-      },
-      "type": "n8n-nodes-base.gmail",
-      "typeVersion": 2.2,
-      "position": [
-        1408,
-        -432
-      ],
-      "id": "ade218b4-bfd7-4ec2-bb0c-b8d340548851",
-      "name": "Add Label",
-      "webhookId": "e7dea26f-1c69-47fd-b7e1-2664c82f5361"
-    },
-    {
-      "parameters": {
         "jsCode": "// 1. Get all labels (Static, so we fetch them once for the whole batch)\nconst allLabels = $('Get All Current Labels').all().map(item => item.json);\n\n// 2. Iterate over \"items\" (The default variable containing your batch of results from Classify)\nreturn items.map((item, index) => {\n  try {\n    // A. Get the LLM text for THIS specific item\n    // We access the current 'item' in the loop, not the global .first()\n    const llmLabelName = item.json.content.parts[0].text.trim();\n\n    // B. Get the Message ID for THIS specific item\n    // We look back at the 'Merge' node results.\n    // By using [index], we ensure we grab the ID that corresponds to this specific execution.\n    const msgId = $('Merge').all()[index].json.id; \n\n    // C. Find the matching Label ID\n    const matchedLabel = allLabels.find(l => l.name === llmLabelName);\n\n    if (!matchedLabel) {\n       // Optional: Log it but don't crash the whole batch\n       return { json: { error: `Label not found: ${llmLabelName}`, msg_id: msgId } };\n    }\n\n    return {\n      json: {\n        msg_id: msgId,\n        label_id: matchedLabel.id,\n        // Optional: Helpful to keep this for debugging if something goes wrong\n        applied_label_name: llmLabelName\n      }\n    };\n    \n  } catch (error) {\n    // If one email fails (e.g. LLM returned bad JSON), this ensures the other 49 still process\n    return {\n      json: {\n        error: error.message,\n        item_index: index\n      }\n    };\n  }\n});"
       },
       "type": "n8n-nodes-base.code",
@@ -125,7 +109,7 @@
       "typeVersion": 2.2,
       "position": [
         -288,
-        -504
+        -512
       ],
       "id": "a3b3d938-fba8-4a50-a5b1-8fa6c1f50d2c",
       "name": "Get Unprocessed Messages",
@@ -144,7 +128,7 @@
       "typeVersion": 2.2,
       "position": [
         -288,
-        -312
+        -320
       ],
       "id": "8191d0fe-05d6-4d7e-9b6f-d04bc52f4a7b",
       "name": "Get Requested Messages",
@@ -285,10 +269,78 @@
       "typeVersion": 2.3,
       "position": [
         -64,
-        -696
+        -704
       ],
       "id": "3a101383-39a3-4e56-a980-8a48350bcd10",
       "name": "Filter Labels"
+    },
+    {
+      "parameters": {
+        "operation": "removeLabels",
+        "messageId": "={{ $json.id }}",
+        "labelIds": [
+          "INBOX",
+          "UNREAD"
+        ]
+      },
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.2,
+      "position": [
+        1856,
+        -432
+      ],
+      "id": "639a3347-883f-46ca-b0a7-e255cbe47d23",
+      "name": "Archive",
+      "webhookId": "c92326ff-37df-4853-8d08-e896e7e20410"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "ebb85020-fbc8-4f37-b658-d2554634142d",
+              "leftValue": "={{ $('Match Msg ID / Label ID').item.json.applied_label_name }}",
+              "rightValue": "Shopping/\\w+",
+              "operator": {
+                "type": "string",
+                "operation": "regex"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.filter",
+      "typeVersion": 2.3,
+      "position": [
+        1632,
+        -432
+      ],
+      "id": "a1d129ae-bb79-4dfb-a9f8-ffb75b2755e3",
+      "name": "Filter Inbox Worthy Messages"
+    },
+    {
+      "parameters": {
+        "operation": "addLabels",
+        "messageId": "={{ $json.msg_id }}",
+        "labelIds": "={{ [$json.label_id,\"Label_3690428769571063072\"] }}"
+      },
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.2,
+      "position": [
+        1408,
+        -432
+      ],
+      "id": "ade218b4-bfd7-4ec2-bb0c-b8d340548851",
+      "name": "Assign Label",
+      "webhookId": "e7dea26f-1c69-47fd-b7e1-2664c82f5361"
     }
   ],
   "connections": {
@@ -340,7 +392,7 @@
       "main": [
         [
           {
-            "node": "Add Label",
+            "node": "Assign Label",
             "type": "main",
             "index": 0
           }
@@ -383,11 +435,6 @@
             "index": 0
           }
         ]
-      ]
-    },
-    "Add Label": {
-      "main": [
-        []
       ]
     },
     "Email": {
@@ -449,6 +496,28 @@
         [
           {
             "node": "Sort",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Filter Inbox Worthy Messages": {
+      "main": [
+        [
+          {
+            "node": "Archive",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Assign Label": {
+      "main": [
+        [
+          {
+            "node": "Filter Inbox Worthy Messages",
             "type": "main",
             "index": 0
           }
