@@ -1,7 +1,7 @@
 {
   "id": "e0vcY_9yGvQbABiZQrzvX",
   "name": "Inbox Organizer - Event & Schedule",
-  "active": false,
+  "active": true,
   "nodes": [
     {
       "parameters": {
@@ -206,7 +206,8 @@
         -480
       ],
       "id": "0fe0a19d-8e9c-4f85-998a-345c4610ece0",
-      "name": "Requested Messages"
+      "name": "Requested Messages",
+      "disabled": true
     },
     {
       "parameters": {
@@ -536,7 +537,10 @@
   "settings": {
     "executionOrder": "v1",
     "binaryMode": "separate",
-    "availableInMCP": false
+    "availableInMCP": false,
+    "timeSavedMode": "fixed",
+    "saveExecutionProgress": true,
+    "callerPolicy": "workflowsFromSameOwner"
   },
   "pinData": {},
   "meta": {

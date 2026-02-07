@@ -1,10 +1,17 @@
 {
   "id": "9w0kj0l2hD3kP8LcPqKMW",
   "name": "Inbox Organizer - Agent Chat",
-  "active": false,
+  "active": true,
   "nodes": [
     {
       "parameters": {
+        "availableInChat": true,
+        "agentIcon": {
+          "type": "icon",
+          "value": "mail"
+        },
+        "agentName": "Inbox Organizer",
+        "agentDescription": "A Gmail empowered agent ready to help label and organize, Marie Kondo style",
         "options": {}
       },
       "type": "@n8n/n8n-nodes-langchain.chatTrigger",
@@ -24,7 +31,7 @@
       "type": "@n8n/n8n-nodes-langchain.agent",
       "typeVersion": 3.1,
       "position": [
-        600,
+        608,
         0
       ],
       "id": "d121d8ec-05a9-497a-8808-0c7babd52391",
