@@ -18,7 +18,7 @@
       "typeVersion": 1,
       "position": [
         384,
-        -704
+        -696
       ],
       "id": "ca02cb57-af5a-4cf1-a8d2-dd0d5ba9f509",
       "name": "Aggregate"
@@ -32,7 +32,7 @@
       "typeVersion": 2.2,
       "position": [
         -288,
-        -704
+        -696
       ],
       "id": "cb37f2b5-8e3d-4e79-8856-1b7288b48972",
       "name": "Get All Current Labels",
@@ -53,7 +53,7 @@
       "typeVersion": 1,
       "position": [
         160,
-        -704
+        -696
       ],
       "id": "dcd8b9ee-d475-4d4b-a13a-a547baf1ca09",
       "name": "Sort"
@@ -102,14 +102,14 @@
       "parameters": {
         "operation": "getAll",
         "filters": {
-          "q": "=-label:z_n8n_processed"
+          "q": "=-label:.n8n/processed"
         }
       },
       "type": "n8n-nodes-base.gmail",
       "typeVersion": 2.2,
       "position": [
         -288,
-        -512
+        -504
       ],
       "id": "a3b3d938-fba8-4a50-a5b1-8fa6c1f50d2c",
       "name": "Get Unprocessed Messages",
@@ -128,7 +128,7 @@
       "typeVersion": 2.2,
       "position": [
         -288,
-        -320
+        -312
       ],
       "id": "8191d0fe-05d6-4d7e-9b6f-d04bc52f4a7b",
       "name": "Get Requested Messages",
@@ -279,7 +279,7 @@
       "typeVersion": 2.3,
       "position": [
         -64,
-        -704
+        -696
       ],
       "id": "3a101383-39a3-4e56-a980-8a48350bcd10",
       "name": "Filter Labels"
