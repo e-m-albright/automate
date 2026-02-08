@@ -2,6 +2,11 @@
 
 Email and content automation with [n8n](https://n8n.io/) and [Ollama](https://ollama.com/) for local LLM.
 
+Gemini Use
+
+- **[Gemini pricing](https://ai.google.dev/gemini-api/docs/pricing)**
+- **[Billed usage](https://aistudio.google.com/usage?timeRange=last-28-days)**
+
 ## Quick start
 
 ```bash
@@ -15,7 +20,7 @@ just import-workflows
 
 You'll need to configure your gmail / gemini / ollama as you desire to enable the automations.
 
-[Check this for gemini pricing.](https://ai.google.dev/gemini-api/docs/pricing)
+
 
 Finally, publish the workflows and all should be running.
 
