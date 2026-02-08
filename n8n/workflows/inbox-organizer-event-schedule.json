@@ -60,39 +60,12 @@
     },
     {
       "parameters": {
-        "modelId": {
-          "__rl": true,
-          "value": "models/gemini-3-flash-preview",
-          "mode": "list",
-          "cachedResultName": "models/gemini-3-flash-preview"
-        },
-        "messages": {
-          "values": [
-            {
-              "content": "=You are an expert email classifier. Your goal is to route emails to the correct category based on the provided list.\n\n### INPUT DATA\n**From:** {{ $('Email').item.json.from }}\n**Subject:** {{ $('Email').item.json.subject }}\n**Content:** {{ $('Email').item.json.preview }}\n\n### VALID LABELS\n- {{ $('Aggregate').first().json.name.join('\\n- ') }}\n\n### INSTRUCTIONS\n1. **Analyze:** Read the sender, subject, and content.\n2. **Match:** Select the *single* most appropriate label from the \"VALID LABELS\" list.\n3. **Output:** Return **ONLY** the exact label name.\n   - Do not include reasoning.\n   - Do not include markdown formatting (like bolding or backticks).\n   - Do not include the word \"Label:\".\n   - If no label matches perfectly, return \"INBOX\".\n\n### EXAMPLE OUTPUT\nContent/Newsletter"
-            }
-          ]
-        },
-        "builtInTools": {},
-        "options": {}
-      },
-      "type": "@n8n/n8n-nodes-langchain.googleGemini",
-      "typeVersion": 1.1,
-      "position": [
-        832,
-        -528
-      ],
-      "id": "b476de1b-7367-49aa-b0f0-bc7afc0750aa",
-      "name": "Classify"
-    },
-    {
-      "parameters": {
-        "jsCode": "// 1. Get all labels (Static, so we fetch them once for the whole batch)\nconst allLabels = $('Get All Current Labels').all().map(item => item.json);\n\n// 2. Iterate over \"items\" (The default variable containing your batch of results from Classify)\nreturn items.map((item, index) => {\n  try {\n    // A. Get the LLM text for THIS specific item\n    // We access the current 'item' in the loop, not the global .first()\n    const llmLabelName = item.json.content.parts[0].text.trim();\n\n    // B. Get the Message ID for THIS specific item\n    // We look back at the 'Merge' node results.\n    // By using [index], we ensure we grab the ID that corresponds to this specific execution.\n    const msgId = $('Merge').all()[index].json.id; \n\n    // C. Find the matching Label ID\n    const matchedLabel = allLabels.find(l => l.name === llmLabelName);\n\n    if (!matchedLabel) {\n       // Optional: Log it but don't crash the whole batch\n       return { json: { error: `Label not found: ${llmLabelName}`, msg_id: msgId } };\n    }\n\n    return {\n      json: {\n        msg_id: msgId,\n        label_id: matchedLabel.id,\n        // Optional: Helpful to keep this for debugging if something goes wrong\n        applied_label_name: llmLabelName\n      }\n    };\n    \n  } catch (error) {\n    // If one email fails (e.g. LLM returned bad JSON), this ensures the other 49 still process\n    return {\n      json: {\n        error: error.message,\n        item_index: index\n      }\n    };\n  }\n});"
+        "jsCode": "// 1. Get all labels (Static, so we fetch them once for the whole batch)\nconst allLabels = $('Get All Current Labels').all().map(item => item.json);\n\n// 2. Iterate over \"items\" (The default variable containing your batch of results from Classify)\nreturn items.map((item, index) => {\n  try {\n    // A. Get the LLM text for THIS specific item\n    // We access the current 'item' in the loop, not the global .first()\n    const llmLabelName = item.json.content.trim();\n\n    // B. Get the Message ID for THIS specific item\n    // We look back at the 'Merge' node results.\n    // By using [index], we ensure we grab the ID that corresponds to this specific execution.\n    const msgId = $('Merge Email + Labels').all()[index].json.id; \n\n    // C. Find the matching Label ID\n    const matchedLabel = allLabels.find(l => l.name === llmLabelName);\n\n    if (!matchedLabel) {\n       // Optional: Log it but don't crash the whole batch\n       return { json: { error: `Label not found: ${llmLabelName}`, msg_id: msgId } };\n    }\n\n    return {\n      json: {\n        msg_id: msgId,\n        label_id: matchedLabel.id,\n        // Optional: Helpful to keep this for debugging if something goes wrong\n        applied_label_name: llmLabelName\n      }\n    };\n    \n  } catch (error) {\n    // If one email fails (e.g. LLM returned bad JSON), this ensures the other 49 still process\n    return {\n      json: {\n        error: error.message,\n        item_index: index\n      }\n    };\n  }\n});"
       },
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
-        1184,
+        1856,
         -528
       ],
       "id": "25788261-1812-4e9b-8190-a5c948d71afe",
@@ -102,7 +75,7 @@
       "parameters": {
         "operation": "getAll",
         "filters": {
-          "q": "=-label:.n8n/Processed"
+          "q": "=-label:.n8n"
         }
       },
       "type": "n8n-nodes-base.gmail",
@@ -137,26 +110,10 @@
     },
     {
       "parameters": {
-        "mode": "raw",
-        "jsonOutput": "={\n  \"id\": \"{{ $json.id }}\",\n  \"from\": {{ JSON.stringify($json.From) }},\n  \"to\": {{ JSON.stringify($json.To) }},\n  \"subject\": {{ JSON.stringify($json.Subject) }},\n  \"preview\": {{ JSON.stringify($json.snippet) }},\n}",
-        "options": {}
-      },
-      "type": "n8n-nodes-base.set",
-      "typeVersion": 3.4,
-      "position": [
-        -64,
-        -432
-      ],
-      "id": "a23124c4-f737-4b7f-9fdb-4b4bdf36b7ec",
-      "name": "Email"
-    },
-    {
-      "parameters": {
         "rule": {
           "interval": [
             {
-              "field": "minutes",
-              "minutesInterval": 10
+              "field": "minutes"
             }
           ]
         }
@@ -169,21 +126,6 @@
       ],
       "id": "c59c8b6e-8a35-492e-83b7-925542b48de1",
       "name": "Unprocessed Messages"
-    },
-    {
-      "parameters": {
-        "mode": "combine",
-        "combineBy": "combineAll",
-        "options": {}
-      },
-      "type": "n8n-nodes-base.merge",
-      "typeVersion": 3.2,
-      "position": [
-        608,
-        -528
-      ],
-      "id": "c22def1e-c5bd-416a-8738-a2d56ddaf1db",
-      "name": "Merge"
     },
     {
       "parameters": {
@@ -256,8 +198,8 @@
       "type": "n8n-nodes-base.gmail",
       "typeVersion": 2.2,
       "position": [
-        1856,
-        -528
+        2528,
+        -624
       ],
       "id": "639a3347-883f-46ca-b0a7-e255cbe47d23",
       "name": "Archive",
@@ -290,8 +232,8 @@
       "type": "n8n-nodes-base.filter",
       "typeVersion": 2.3,
       "position": [
-        1632,
-        -528
+        2304,
+        -624
       ],
       "id": "a1d129ae-bb79-4dfb-a9f8-ffb75b2755e3",
       "name": "Filter Inbox Worthy Messages"
@@ -305,12 +247,256 @@
       "type": "n8n-nodes-base.gmail",
       "typeVersion": 2.2,
       "position": [
-        1408,
-        -528
+        2080,
+        -624
       ],
       "id": "ade218b4-bfd7-4ec2-bb0c-b8d340548851",
       "name": "Assign Label",
       "webhookId": "e7dea26f-1c69-47fd-b7e1-2664c82f5361"
+    },
+    {
+      "parameters": {
+        "mode": "combine",
+        "combineBy": "combineAll",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3.2,
+      "position": [
+        608,
+        -528
+      ],
+      "id": "c22def1e-c5bd-416a-8738-a2d56ddaf1db",
+      "name": "Merge Email + Labels"
+    },
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3.2,
+      "position": [
+        1632,
+        -528
+      ],
+      "id": "787d7991-6c0d-4210-8eb6-08766e27568b",
+      "name": "Merge AI Provider Choice Paths"
+    },
+    {
+      "parameters": {
+        "mode": "raw",
+        "jsonOutput": "={\n  \"id\": \"{{ $json.id }}\",\n  \"from\": {{ JSON.stringify($json.From) }},\n  \"to\": {{ JSON.stringify($json.To) }},\n  \"subject\": {{ JSON.stringify($json.Subject) }},\n  \"preview\": {{ JSON.stringify($json.snippet) }},\n}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -64,
+        -432
+      ],
+      "id": "a23124c4-f737-4b7f-9fdb-4b4bdf36b7ec",
+      "name": "Normalize Email"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "ba2194ad-cd24-4a3a-a0f9-47314d627abb",
+              "name": "content",
+              "value": "={{ $json.content }}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        1408,
+        -624
+      ],
+      "id": "33d22446-d877-4b33-965d-1af28537a0f0",
+      "name": "Normalize Ollama"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "ef04daf5-d63d-45aa-965e-b8f1c82f1ab6",
+              "name": "content",
+              "value": "={{ $json.content.parts[0].text }}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        1408,
+        -432
+      ],
+      "id": "01c5f5a0-b2ce-4293-a7f3-87d6fa0a4b7c",
+      "name": "Normalize Gemini"
+    },
+    {
+      "parameters": {
+        "modelId": {
+          "__rl": true,
+          "value": "llama3.2:latest",
+          "mode": "list",
+          "cachedResultName": "llama3.2:latest"
+        },
+        "messages": {
+          "values": [
+            {
+              "content": "=You are an expert email classifier. Your goal is to route emails to the correct category based on the provided list.\n\n### INPUT DATA\n**From:** {{ $('Normalize Email').item.json.from }}\n**Subject:** {{ $('Normalize Email').item.json.subject }}\n**Content:** {{ $('Normalize Email').item.json.preview }}\n\n### VALID LABELS\n- {{ $('Aggregate').first().json.name.join('\\n- ') }}\n\n### INSTRUCTIONS\n1. **Analyze:** Read the sender, subject, and content.\n2. **Match:** Select the *single* most appropriate label from the \"VALID LABELS\" list.\n3. **Output:** Return **ONLY** the exact label name.\n   - Do not include reasoning.\n   - Do not include markdown formatting (like bolding or backticks).\n   - Do not include the word \"Label:\".\n   - If no label matches perfectly, return \"INBOX\".\n\n### EXAMPLE OUTPUT\nContent/Newsletter"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.ollama",
+      "typeVersion": 1,
+      "position": [
+        1056,
+        -624
+      ],
+      "id": "e2167b91-65a8-4b0e-8e2a-d329e6936ff8",
+      "name": "Classify Ollama"
+    },
+    {
+      "parameters": {
+        "modelId": {
+          "__rl": true,
+          "value": "models/gemini-3-flash-preview",
+          "mode": "list",
+          "cachedResultName": "models/gemini-3-flash-preview"
+        },
+        "messages": {
+          "values": [
+            {
+              "content": "=You are an expert email classifier. Your goal is to route emails to the correct category based on the provided list.\n\n### INPUT DATA\n**From:** {{ $('Normalize Email').item.json.from }}\n**Subject:** {{ $('Normalize Email').item.json.subject }}\n**Content:** {{ $('Normalize Email').item.json.preview }}\n\n### VALID LABELS\n- {{ $('Aggregate').first().json.name.join('\\n- ') }}\n\n### INSTRUCTIONS\n1. **Analyze:** Read the sender, subject, and content.\n2. **Match:** Select the *single* most appropriate label from the \"VALID LABELS\" list.\n3. **Output:** Return **ONLY** the exact label name.\n   - Do not include reasoning.\n   - Do not include markdown formatting (like bolding or backticks).\n   - Do not include the word \"Label:\".\n   - If no label matches perfectly, return \"INBOX\".\n\n### EXAMPLE OUTPUT\nContent/Newsletter"
+            }
+          ]
+        },
+        "builtInTools": {},
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.googleGemini",
+      "typeVersion": 1.1,
+      "position": [
+        1056,
+        -432
+      ],
+      "id": "b476de1b-7367-49aa-b0f0-bc7afc0750aa",
+      "name": "Classify Gemini"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": false,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "75ca42ce-8b89-43d0-8721-12d66f99feef",
+              "leftValue": "use_private_ai",
+              "rightValue": "use_commercial_ai",
+              "operator": {
+                "type": "string",
+                "operation": "equals",
+                "name": "filter.operator.equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {
+          "ignoreCase": true
+        }
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        832,
+        -528
+      ],
+      "id": "6f987bc9-a196-4c27-9115-35edc6f99a37",
+      "name": "Active = Gemini"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "bc733994-659c-467b-b017-067bb806ce06",
+              "name": "from",
+              "value": "={{ $('Normalize Email').item.json.from }}",
+              "type": "string"
+            },
+            {
+              "id": "2fe3f73a-7676-4517-91b3-2b6a824581e9",
+              "name": "to",
+              "value": "={{ $('Normalize Email').item.json.to }}",
+              "type": "string"
+            },
+            {
+              "id": "223eec8b-6331-42a7-90e3-15f3059cfafd",
+              "name": "subject",
+              "value": "={{ $('Normalize Email').item.json.subject }}",
+              "type": "string"
+            },
+            {
+              "id": "34d20c67-f70c-435c-9b37-fd5a2f36eaa9",
+              "name": "preview",
+              "value": "={{ $('Normalize Email').item.json.preview }}",
+              "type": "string"
+            },
+            {
+              "id": "baab3e08-4f69-421e-bac0-7e4bfc0c2532",
+              "name": "applied_label_name",
+              "value": "={{ $json.applied_label_name }}",
+              "type": "string"
+            },
+            {
+              "id": "4549ee1c-953e-441f-a814-36e6c64e78b9",
+              "name": "label_id",
+              "value": "={{ $json.label_id }}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        2080,
+        -432
+      ],
+      "id": "1d3e2354-dc32-4d7b-a4ae-1bfe03428af6",
+      "name": "Review Assigned Labels"
+    },
+    {
+      "parameters": {
+        "content": "## Toggle Control\nDeactivated = Ollama\nActivated = Gemini",
+        "height": 272,
+        "width": 192
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        784,
+        -640
+      ],
+      "id": "657b5acc-4060-44bb-8b2f-66e512732bac",
+      "name": "Sticky Note"
     }
   ],
   "connections": {
@@ -318,7 +504,7 @@
       "main": [
         [
           {
-            "node": "Merge",
+            "node": "Merge Email + Labels",
             "type": "main",
             "index": 0
           }
@@ -347,22 +533,16 @@
         ]
       ]
     },
-    "Classify": {
-      "main": [
-        [
-          {
-            "node": "Match Msg ID / Label ID",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
     "Match Msg ID / Label ID": {
       "main": [
         [
           {
             "node": "Assign Label",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Review Assigned Labels",
             "type": "main",
             "index": 0
           }
@@ -373,7 +553,7 @@
       "main": [
         [
           {
-            "node": "Email",
+            "node": "Normalize Email",
             "type": "main",
             "index": 0
           }
@@ -384,7 +564,7 @@
       "main": [
         [
           {
-            "node": "Email",
+            "node": "Normalize Email",
             "type": "main",
             "index": 0
           },
@@ -392,17 +572,6 @@
             "node": "Get All Current Labels",
             "type": "main",
             "index": 0
-          }
-        ]
-      ]
-    },
-    "Email": {
-      "main": [
-        [
-          {
-            "node": "Merge",
-            "type": "main",
-            "index": 1
           }
         ]
       ]
@@ -417,17 +586,6 @@
           },
           {
             "node": "Get All Current Labels",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "Merge": {
-      "main": [
-        [
-          {
-            "node": "Classify",
             "type": "main",
             "index": 0
           }
@@ -461,6 +619,101 @@
         [
           {
             "node": "Filter Inbox Worthy Messages",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge Email + Labels": {
+      "main": [
+        [
+          {
+            "node": "Active = Gemini",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge AI Provider Choice Paths": {
+      "main": [
+        [
+          {
+            "node": "Match Msg ID / Label ID",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize Email": {
+      "main": [
+        [
+          {
+            "node": "Merge Email + Labels",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Normalize Ollama": {
+      "main": [
+        [
+          {
+            "node": "Merge AI Provider Choice Paths",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize Gemini": {
+      "main": [
+        [
+          {
+            "node": "Merge AI Provider Choice Paths",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Classify Ollama": {
+      "main": [
+        [
+          {
+            "node": "Normalize Ollama",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Classify Gemini": {
+      "main": [
+        [
+          {
+            "node": "Normalize Gemini",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Active = Gemini": {
+      "main": [
+        [
+          {
+            "node": "Classify Ollama",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Classify Gemini",
             "type": "main",
             "index": 0
           }
