@@ -1,11 +1,18 @@
 # Automate
 
-Email and content automation with [n8n](https://n8n.io/) and [Ollama](https://ollama.com/) for local LLM.
+Email and content automation with [n8n](https://n8n.io/), [Ollama](https://ollama.com/) for local LLM work, and workflows leaning on Gemini for commercial LLM work.
 
-Gemini Use
+## Ollama / Gemini Use
 
 - **[Gemini pricing](https://ai.google.dev/gemini-api/docs/pricing)**
 - **[Billed usage](https://aistudio.google.com/usage?timeRange=last-28-days)**
+
+## Follow Up Work
+- Set up label quality evals
+- Add guardrails to check for malicious email content being passed to LLM
+- Tweak thread/message interactions - presently email threads will get 1 labeling pass per message, may not be ideal experience
+- Improve label quality by using the whole email not the simplified "snippet"
+- Add a label creator for one time or dynamic label management
 
 ## Quick start
 
@@ -19,8 +26,6 @@ just import-workflows
 **Services:** n8n at `http://localhost:5678`, Ollama at `http://localhost:11434`. Use the Ollama node in n8n with base URL `http://ollama:11434` when running in Docker.
 
 You'll need to configure your gmail / gemini / ollama as you desire to enable the automations.
-
-
 
 Finally, publish the workflows and all should be running.
 
@@ -57,3 +62,51 @@ automate/
 ## Deployment
 
 Run locally with Docker Compose. For always-on access, run the same stack on a VPS and expose n8n (e.g. Cloudflare Tunnel).
+
+
+## My Email Labels
+```
+# "Processed" email breadcrumb, hidden
+.n8n
+
+# Auto-archive
+Content/
+├── Educational Reference
+├── Newsletter
+└── Product Update
+
+Financial/
+├── Banking
+├── Insurance
+├── Investments
+├── Subscriptions
+├── Taxes
+└── Utilities & Bills
+
+Personal/
+├── Auto
+├── Civic
+├── Health
+├── House
+├── Kid
+├── Travel
+└── Wedding
+
+Priority/
+├── Calendar Events
+├── Legal
+└── Security & Login
+
+Professional/
+├── Networking
+├── Opportunities
+└── Recruiters
+
+# Auto-archive
+Shopping/
+├── Customer Service
+├── Fulfillment
+├── Housing Search
+├── Promotion
+└── Receipt
+ ```
