@@ -35,8 +35,16 @@ echo ""
 echo "Waiting for Ollama to be ready..."
 sleep 5
 
-echo "Pulling default model (llama3.2)..."
-docker exec automate-ollama ollama pull llama3.2
+echo "Pulling models..."
+# Load model selection from .env (defaults used if unset)
+set -a
+source .env 2>/dev/null || true
+set +a
+docker exec automate-ollama ollama pull "${OLLAMA_SETUP_LOCAL_MODEL:-gemma3:latest}"
+if [ -n "${OLLAMA_SETUP_CLOUD_MODEL:-}" ]; then
+    docker exec automate-ollama ollama signin
+    docker exec automate-ollama ollama pull "$OLLAMA_SETUP_CLOUD_MODEL"
+fi
 
 echo ""
 echo "=== Setup Complete ==="

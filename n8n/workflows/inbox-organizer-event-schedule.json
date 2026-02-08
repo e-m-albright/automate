@@ -345,9 +345,9 @@
       "parameters": {
         "modelId": {
           "__rl": true,
-          "value": "llama3.2:latest",
+          "value": "gemma3:latest",
           "mode": "list",
-          "cachedResultName": "llama3.2:latest"
+          "cachedResultName": "gemma3:latest"
         },
         "messages": {
           "values": [
@@ -428,7 +428,8 @@
         -528
       ],
       "id": "6f987bc9-a196-4c27-9115-35edc6f99a37",
-      "name": "Active = Gemini"
+      "name": "Active = Gemini",
+      "disabled": true
     },
     {
       "parameters": {
