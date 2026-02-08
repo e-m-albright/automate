@@ -2,12 +2,15 @@
 
 Email and content automation with [n8n](https://n8n.io/), [Ollama](https://ollama.com/) for local LLM work, and workflows leaning on Gemini for commercial LLM work.
 
-## Ollama / Gemini Use
+## Current Workflows
 
-- **[Gemini pricing](https://ai.google.dev/gemini-api/docs/pricing)**
-- **[Billed usage](https://aistudio.google.com/usage?timeRange=last-28-days)**
+1. Email label organizer. All new emails + batches of old emails are sent to an LLM to apply one of your current list of Gmail labels, and archive labels you select to help keep your inbox clear
+1. An agent set up to chat with you over your emails to potentially operate autonomously on modifying email labels - far less tested + likely a less stable experience
+1. A content brief (WIP, not yet implemented) - consume news / newsletter content to consolidate + provide page summaries to reduce catch-up fatigue
+
 
 ## Follow Up Work
+- Host on https://console.hetzner.com/projects w/ Cloudflare Tunnel if always on is desired
 - Set up label quality evals
 - Add guardrails to check for malicious email content being passed to LLM
 - Tweak thread/message interactions - presently email threads will get 1 labeling pass per message, may not be ideal experience
@@ -63,6 +66,10 @@ automate/
 
 Run locally with Docker Compose. For always-on access, run the same stack on a VPS and expose n8n (e.g. Cloudflare Tunnel).
 
+## Ollama / Gemini Use
+
+- **[Gemini pricing](https://ai.google.dev/gemini-api/docs/pricing)**
+- **[Billed usage](https://aistudio.google.com/usage?timeRange=last-28-days)**
 
 ## My Email Labels
 ```
