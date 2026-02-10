@@ -5,22 +5,29 @@
   "nodes": [
     {
       "parameters": {
-        "rule": {
-          "interval": [
-            {
-              "triggerAtHour": 5
-            }
-          ]
-        }
+        "jsCode": "// ============================================================\n// n8n Code Node 2: Prepare URLs for Phase 2\n// ============================================================\n// Replaces the tracking URL resolver.\n//\n// Instead of trying to resolve tracking URLs (which are blocked\n// by bot detection like PerimeterX and Akamai), this node:\n//\n// 1. Passes direct content URLs through for crawling in Phase 2\n// 2. Keeps tracking URLs as metadata for LLM context\n// 3. Deduplicates everything\n// 4. Pairs tracking URLs with their surrounding text context\n//    so the LLM can infer what they link to\n// ============================================================\n\n// --- URL normalization for dedup ---\nfunction normalizeUrl(url) {\n  try {\n    const u = new URL(url);\n    const trackingParams = [\n      'utm_source', 'utm_medium', 'utm_campaign', 'utm_content', 'utm_term',\n      'mc_cid', 'mc_eid', 'ref', 'source', 'fbclid', 'gclid',\n      'rcm', 'gaa_at', 'gaa_n', 'gaa_ts', 'gaa_sig',\n    ];\n    trackingParams.forEach(p => u.searchParams.delete(p));\n    u.hash = '';\n    return u.toString().replace(/\\/+$/, '');\n  } catch {\n    return url;\n  }\n}\n\n// --- Extract context around each tracking URL ---\n// Grabs the text surrounding a URL in the email body so the LLM\n// can figure out what the link points to.\nfunction extractUrlContext(bodyText, url, contextChars = 200) {\n  const idx = bodyText.indexOf(url);\n  if (idx === -1) return null;\n\n  const start = Math.max(0, idx - contextChars);\n  const end = Math.min(bodyText.length, idx + url.length + contextChars);\n  const snippet = bodyText.substring(start, end).trim();\n\n  // Clean up: grab the text before and after the URL\n  const before = bodyText.substring(start, idx).trim();\n  const after = bodyText.substring(idx + url.length, end).trim();\n\n  return { before, after };\n}\n\n// --- Main Processing ---\nconst results = [];\n\nfor (const item of $input.all()) {\n  const data = item.json;\n\n  // Deduplicate content URLs\n  const seen = new Set();\n  const deduplicatedContentUrls = [];\n  for (const url of (data.contentUrls || [])) {\n    const normalized = normalizeUrl(url);\n    if (!seen.has(normalized)) {\n      seen.add(normalized);\n      deduplicatedContentUrls.push(url);\n    }\n  }\n\n  // Build tracking URL context for the LLM\n  const trackingUrlsWithContext = [];\n  const trackingSeen = new Set();\n\n  for (const url of (data.trackingUrls || [])) {\n    // Basic dedup on tracking URLs (exact match since we can't normalize these)\n    if (trackingSeen.has(url)) continue;\n    trackingSeen.add(url);\n\n    const context = extractUrlContext(data.bodyText || '', url);\n    trackingUrlsWithContext.push({\n      url: url,\n      contextBefore: context?.before || '',\n      contextAfter: context?.after || '',\n    });\n  }\n\n  results.push({\n    json: {\n      emailId: data.emailId,\n      threadId: data.threadId,\n      receivedDate: data.receivedDate,\n      sender: data.sender,\n      senderEmail: data.senderEmail,\n      subject: data.subject,\n      bodyText: data.bodyText,\n      bodyWordCount: data.bodyWordCount,\n      newsletterType: data.newsletterType,\n\n      // Direct URLs we can actually crawl in Phase 2\n      contentUrls: deduplicatedContentUrls,\n\n      // Tracking URLs with surrounding text for LLM inference\n      trackingUrlsWithContext: trackingUrlsWithContext,\n\n      urlStats: {\n        totalExtracted: data.totalUrlsFound,\n        junkFiltered: data.junkUrlsFiltered,\n        directContentUrls: deduplicatedContentUrls.length,\n        unresolvedTrackingUrls: trackingUrlsWithContext.length,\n      },\n    }\n  });\n}\n\nreturn results;"
       },
-      "type": "n8n-nodes-base.scheduleTrigger",
-      "typeVersion": 1.3,
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
       "position": [
-        0,
-        0
+        672,
+        -96
       ],
-      "id": "e8f40fec-5aba-4a78-84d7-8f7f3e379972",
-      "name": "Schedule Trigger"
+      "id": "e7498b7b-ae9e-47bf-a406-3a244113094c",
+      "name": "Provide Tracking URLs w/ Context"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// n8n Code Node 1: Extract & Classify URLs from Email Body\n// ============================================================\n// Input: Gmail node output (each item = one email)\n// Output: One item per email with extracted/classified URLs\n//\n// Expects each input item to have:\n//   - json.id           (Gmail message ID)\n//   - json.labelIds     (array of label IDs)\n//   - json.date         (received date)\n//   - json.from.value[0].address  (sender email)\n//   - json.from.value[0].name     (sender name)\n//   - json.subject\n//   - json.textPlain    (plaintext body — preferred)\n//   - json.textHtml     (HTML body — fallback)\n// ============================================================\n\n// --- Configuration ---\n\nconst JUNK_URL_PATTERNS = [\n  // Unsubscribe / email management\n  /unsubscribe/i,\n  /email[-_]?pref/i,\n  /manage[-_]?pref/i,\n  /opt[-_]?out/i,\n  /email[-_]?settings/i,\n  /subscription[-_]?manage/i,\n\n  // Privacy / legal\n  /\\/privacy/i,\n  /\\/terms/i,\n  /\\/legal/i,\n  /\\/cookie/i,\n  /\\/gdpr/i,\n\n  // Social sharing (not content)\n  /facebook\\.com\\/sharer/i,\n  /twitter\\.com\\/intent/i,\n  /linkedin\\.com\\/share/i,\n  /api\\.whatsapp\\.com/i,\n  /pinterest\\.com\\/pin\\/create/i,\n\n  // App stores\n  /apps\\.apple\\.com/i,\n  /play\\.google\\.com\\/store/i,\n  /itunes\\.apple\\.com/i,\n\n  // Image/media assets (not articles)\n  /\\.(png|jpg|jpeg|gif|webp|svg|ico|bmp)(\\?.*)?$/i,\n  /cdn-cgi\\/image/i,\n  /media\\.beehiiv\\.com\\/cdn-cgi/i,\n\n  // Fonts, stylesheets, scripts (not content)\n  /fonts\\.googleapis\\.com/i,\n  /fonts\\.gstatic\\.com/i,\n  /\\.css(\\?.*)?$/i,\n  /\\.js(\\?.*)?$/i,\n  /\\.woff2?(\\?.*)?$/i,\n\n  // Tracking pixels / beacons\n  /\\/track\\//i,\n  /\\/beacon\\//i,\n  /\\/pixel/i,\n  /\\/open\\//i,\n  /\\/wf\\/open/i,\n  /width=[\"']?1[\"']?.*height=[\"']?1[\"']?/i,\n\n  // Mail protocols\n  /^mailto:/i,\n  /^tel:/i,\n\n  // Common newsletter platform junk\n  /beehiiv\\.com\\/subscribe/i,\n  /substack\\.com\\/subscribe/i,\n  /list-manage\\.com/i,\n  /mailchimp\\.com\\/.*\\/update-profile/i,\n\n  // Google forms (surveys, not content — adjust if you want these)\n  // /docs\\.google\\.com\\/forms/i,\n\n  // Empty or fragment-only\n  /^#/,\n  /^$/,\n];\n\n// Domains where social posts ARE content (e.g., Instagram posts linked from newsletters)\n// You can toggle these. By default we keep them as some newsletters link to\n// meaningful Instagram content (like Babylist linking Emily Oster posts).\nconst SOCIAL_CONTENT_DOMAINS = [\n  /instagram\\.com\\/p\\//i,     // specific Instagram posts (often content)\n  /youtube\\.com\\/watch/i,     // YouTube videos\n  /youtu\\.be\\//i,\n  /open\\.spotify\\.com/i,      // podcast episodes\n  /tiktok\\.com\\/@.*\\/video/i, // specific TikTok videos\n];\n\n// Known tracking/redirect domains that wrap real URLs\nconst TRACKING_REDIRECT_PATTERNS = [\n  /clicks\\..+\\.(com|org|io)/i,       // e.g., clicks.hi.solidstarts.com\n  /click\\..+\\.(com|org|io)/i,\n  /links\\..+\\.(com|org|io)/i,        // e.g., links.babylist.com\n  /email\\..+\\.com\\/.*click/i,\n  /trk\\./i,\n  /go\\..+\\.(com|org|io)/i,\n  /t\\.co\\//i,                         // Twitter shortener\n  /bit\\.ly\\//i,\n  /buff\\.ly\\//i,\n  /ow\\.ly\\//i,\n  /mailchimp\\.com\\/track\\/click/i,\n  /list-manage\\.com\\/track\\/click/i,\n  /beehiiv\\.com\\/.*\\/clicks/i,\n  /substack\\.com\\/redirect/i,\n];\n\n// Self-referential / homepage links to skip (newsletter's own domain, not articles)\n// Add your newsletter domains here if they link to their own homepages a lot\nconst HOMEPAGE_PATTERNS = [\n  /^https?:\\/\\/(www\\.)?babylist\\.com\\/?$/i,\n  /^https?:\\/\\/(www\\.)?babylist\\.com\\/store\\/?$/i,\n  /^https?:\\/\\/(www\\.)?solidstarts\\.com\\/?$/i,\n  /^https?:\\/\\/(www\\.)?healthtechnerds\\.com\\/?$/i,\n];\n\n// --- Helper Functions ---\n\nfunction extractUrlsFromPlaintext(text) {\n  if (!text) return [];\n  // Match URLs, handling common wrapping patterns:\n  // - Bare URLs on lines\n  // - URLs in parentheses: (https://...)\n  // - URLs in angle brackets: <https://...>\n  const urlRegex = /https?:\\/\\/[^\\s)<>\\]\"',]+/gi;\n  const matches = text.match(urlRegex) || [];\n\n  // Clean trailing punctuation that gets captured\n  return matches.map(url => {\n    // Remove trailing periods, commas, semicolons that aren't part of the URL\n    url = url.replace(/[.,;:!?)]+$/, '');\n    // Remove trailing parentheses only if unbalanced\n    const openParens = (url.match(/\\(/g) || []).length;\n    const closeParens = (url.match(/\\)/g) || []).length;\n    if (closeParens > openParens) {\n      url = url.replace(/\\)+$/, '');\n    }\n    return url;\n  });\n}\n\nfunction extractUrlsFromHtml(html) {\n  if (!html) return [];\n  // Extract href values from anchor tags\n  const hrefRegex = /href=[\"'](https?:\\/\\/[^\"']+)[\"']/gi;\n  const urls = [];\n  let match;\n  while ((match = hrefRegex.exec(html)) !== null) {\n    urls.push(match[1]);\n  }\n  return urls;\n}\n\nfunction isJunkUrl(url) {\n  // Check homepage patterns\n  if (HOMEPAGE_PATTERNS.some(pattern => pattern.test(url))) return true;\n\n  // Check junk patterns\n  if (JUNK_URL_PATTERNS.some(pattern => pattern.test(url))) {\n    // Exception: social content links that ARE worth keeping\n    if (SOCIAL_CONTENT_DOMAINS.some(pattern => pattern.test(url))) {\n      return false;\n    }\n    return true;\n  }\n  return false;\n}\n\nfunction isTrackingRedirect(url) {\n  return TRACKING_REDIRECT_PATTERNS.some(pattern => pattern.test(url));\n}\n\nfunction classifyUrl(url) {\n  if (isJunkUrl(url)) return 'junk';\n  if (isTrackingRedirect(url)) return 'tracking';\n  return 'content';\n}\n\nfunction getBodyText(item) {\n  // Prefer plaintext, fall back to HTML with basic tag stripping\n  if (item.json.text) {\n    return item.json.text;\n  }\n  if (item.json.html) {\n    // Basic HTML → text conversion (the LLM will handle this well enough)\n    return item.json.textHtml\n      .replace(/<style[^>]*>[\\s\\S]*?<\\/style>/gi, '')\n      .replace(/<script[^>]*>[\\s\\S]*?<\\/script>/gi, '')\n      .replace(/<[^>]+>/g, ' ')\n      .replace(/&nbsp;/g, ' ')\n      .replace(/&amp;/g, '&')\n      .replace(/&lt;/g, '<')\n      .replace(/&gt;/g, '>')\n      .replace(/&quot;/g, '\"')\n      .replace(/&#039;/g, \"'\")\n      .replace(/\\s+/g, ' ')\n      .trim();\n  }\n  return '';\n}\n\n// --- Main Processing ---\n\nconst results = [];\n\nfor (const item of $input.all()) {\n  const bodyText = getBodyText(item);\n\n  // Extract URLs from both plaintext and HTML if available\n  const plaintextUrls = extractUrlsFromPlaintext(item.json.text);\n  const htmlUrls = extractUrlsFromHtml(item.json.html);\n\n  // Merge and deduplicate raw URLs\n  const allRawUrls = [...new Set([...plaintextUrls, ...htmlUrls])];\n\n  // Classify each URL\n  const contentUrls = [];\n  const trackingUrls = [];\n  let junkCount = 0;\n\n  for (const url of allRawUrls) {\n    const classification = classifyUrl(url);\n    if (classification === 'content') {\n      contentUrls.push(url);\n    } else if (classification === 'tracking') {\n      trackingUrls.push(url);\n    } else {\n      junkCount++;\n    }\n  }\n\n  // Deduplicate content and tracking URLs\n  const uniqueContentUrls = [...new Set(contentUrls)] || [];\n  const uniqueTrackingUrls = [...new Set(trackingUrls)] || [];\n\n  // Estimate newsletter type based on body text length\n  const wordCount = bodyText.split(/\\s+/).filter(w => w.length > 0).length;\n  const newsletterType = wordCount > 500 ? 'editorial' : 'roundup';\n\n  // Extract sender info safely\n  const senderEmail = item.json.from?.value?.[0]?.address\n    || item.json.from?.text\n    || 'unknown';\n  const senderName = item.json.from?.value?.[0]?.name\n    || senderEmail.split('@')[0]\n    || 'unknown';\n\n  results.push({\n    json: {\n      emailId: item.json.id || '',\n      threadId: item.json.threadId || '',\n      receivedDate: item.json.date || '',\n      sender: senderName,\n      senderEmail: senderEmail,\n      subject: item.json.subject || '',\n      bodyText: bodyText || '',\n      bodyWordCount: wordCount,\n      newsletterType: newsletterType,\n      contentUrls: uniqueContentUrls.length > 0 ? uniqueContentUrls : [],\n      trackingUrls: uniqueTrackingUrls.length > 0 ? uniqueTrackingUrls : [],\n      totalUrlsFound: allRawUrls.length || 0,\n      junkUrlsFiltered: junkCount || 0,\n    }\n  });\n}\n\nreturn results;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        448,
+        -96
+      ],
+      "id": "c98b6a12-bb54-4c3b-aaf1-91dca5c2f99e",
+      "name": "Extract URLs"
     },
     {
       "parameters": {
@@ -38,163 +45,268 @@
       "typeVersion": 2.2,
       "position": [
         224,
-        0
+        -96
       ],
       "id": "704d85ec-763d-45f7-a0fb-83183aeae54a",
-      "name": "Get many messages",
+      "name": "Get Content Emails",
       "webhookId": "9d2e82bc-260a-43b4-8413-3bf0e6312c79"
     },
     {
       "parameters": {
-        "options": {}
+        "rule": {
+          "interval": [
+            {
+              "triggerAtHour": 5
+            }
+          ]
+        }
       },
-      "type": "@n8n/n8n-nodes-langchain.agent",
-      "typeVersion": 3.1,
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.3,
       "position": [
-        632,
-        0
+        0,
+        -96
       ],
-      "id": "1dcbb744-9505-4ab0-aff1-7629872b1388",
-      "name": "AI Agent"
+      "id": "e8f40fec-5aba-4a78-84d7-8f7f3e379972",
+      "name": "Run Daily"
     },
     {
       "parameters": {
+        "fieldToSplitOut": "contentUrls",
+        "include": "selectedOtherFields",
+        "fieldsToInclude": "emailId",
         "options": {}
       },
-      "type": "n8n-nodes-base.httpRequestTool",
-      "typeVersion": 4.4,
-      "position": [
-        704,
-        224
-      ],
-      "id": "193f5ad9-042c-45c1-bfaf-7f7bd5cacc46",
-      "name": "HTTP Request"
-    },
-    {
-      "parameters": {
-        "options": {}
-      },
-      "type": "@n8n/n8n-nodes-langchain.toolSerpApi",
+      "type": "n8n-nodes-base.splitOut",
       "typeVersion": 1,
       "position": [
-        832,
-        224
+        896,
+        0
       ],
-      "id": "af0f79ec-16a6-41cb-b20e-81df10845d21",
-      "name": "SerpAPI"
+      "id": "3adee929-659a-4b3b-9ba5-7bef47d90f18",
+      "name": "Split Out"
     },
     {
       "parameters": {
+        "url": "https://clicks.hi.solidstarts.com/f/a/l_UTkPAH3OXHQ9z8ojZyVw~~/AAQRxRA~/iBrAAwWZAfWEyVrXNhEaw-nJaJPZbp-1UDFigWwCLB7DbwhMBaJMzOx1HljeHydKQ9RnPyRM5936PdREcQRNBRSBnpk3ZYa12wFr-U4UJecL00XUiGyLbUJr0lIpi2t-I9wQggPaLm64gL-K_tP2MKAKb9q_cKe3AT7E5WxnxSQ~",
         "options": {},
         "requestOptions": {}
       },
-      "type": "n8n-nodes-base.jinaAiTool",
+      "type": "n8n-nodes-base.jinaAi",
       "typeVersion": 1,
       "position": [
-        960,
-        224
+        1344,
+        0
       ],
-      "id": "b0f29fc5-6365-48dd-81bf-1e07f0ba88ac",
-      "name": "Read URL content in Jina AI"
+      "id": "a5fb789a-a069-4bb8-84d6-1ba9f8034bd7",
+      "name": "Read URL content"
     },
     {
       "parameters": {
-        "options": {}
+        "operation": "scrape",
+        "requestOptions": {}
       },
-      "type": "@n8n/n8n-nodes-langchain.lmChatGoogleGemini",
+      "type": "@mendable/n8n-nodes-firecrawl.firecrawl",
       "typeVersion": 1,
       "position": [
-        448,
-        224
+        1344,
+        176
       ],
-      "id": "965284f0-8956-4ba3-a670-5f31a50970e6",
-      "name": "Google Gemini Chat Model"
+      "id": "c72d90bb-f6ba-405f-9c9e-148083b4e6c4",
+      "name": "Scrape a URL and get content as markdown or other formats"
     },
     {
-      "parameters": {},
-      "type": "@n8n/n8n-nodes-langchain.memoryBufferWindow",
-      "typeVersion": 1.3,
+      "parameters": {
+        "operation": "batchScrape",
+        "urls": "={{ $json.contentUrls }}",
+        "scrapeOptions": {
+          "options": {
+            "headers": {}
+          }
+        },
+        "requestOptions": {}
+      },
+      "type": "@mendable/n8n-nodes-firecrawl.firecrawl",
+      "typeVersion": 1,
       "position": [
-        576,
-        224
+        896,
+        -192
       ],
-      "id": "8129f808-d020-4333-a97a-3fb26707ae64",
-      "name": "Simple Memory"
+      "id": "89f0270e-b36a-4fb0-a4b2-533ba07bb1e4",
+      "name": "Batch scrape multiple URLs simultaneously"
+    },
+    {
+      "parameters": {
+        "maxItems": 3
+      },
+      "type": "n8n-nodes-base.limit",
+      "typeVersion": 1,
+      "position": [
+        1120,
+        0
+      ],
+      "id": "3963b545-9e23-4087-8775-724b05036aef",
+      "name": "Limit"
+    },
+    {
+      "parameters": {
+        "content": "Jina can read tracking URLs! cool, add back in?\n\nwill get costly perhaps?"
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "position": [
+        1488,
+        272
+      ],
+      "typeVersion": 1,
+      "id": "44806dbc-a87f-45ed-b8f4-2bd008548d81",
+      "name": "Sticky Note"
+    },
+    {
+      "parameters": {
+        "content": "Phase 2: Crawl & Summarize\nFor each extracted URL, you need to:\n\nFetch the page content — n8n's HTTP Request node can do this, but many sites return JS-rendered pages that won't have content in the raw HTML. Options:\n\nHTTP Request node (fast, free, works for most editorial content)\nA headless browser service like Browserless or ScrapingBee if you hit JS-heavy sites\nStart with HTTP Request and only escalate if you're getting empty bodies\n\n\nExtract readable content — You need something like Readability (Mozilla's algorithm) to strip nav, ads, sidebars and get the article text. You can do this in a Code node using a library, or just pass the raw HTML to an LLM and ask it to extract the article content (works surprisingly well but burns tokens).\nSummarize — Send extracted text to Claude/GPT via an AI node. Per-article summaries should capture: headline, key points, why it matters, and any notable data/quotes.\n\nKey decision: Summarize per-article or batch? I'd recommend per-article summaries first, then a final synthesis pass. This gives you granularity and also lets the final pass do the topic clustering with full context.\nRate limiting matters here. If a newsletter has 15 links and you're processing 10 newsletters, that's 150 HTTP requests + 150 LLM calls. You'll want:\n\nA reasonable concurrency limit (don't blast 150 requests simultaneously)\nError handling for 403s, timeouts, paywalled content\nA fallback for paywalled articles (just note \"paywalled — title only\" in the briefing)"
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        1472,
+        -224
+      ],
+      "id": "aa8f8ea2-5669-4293-abe4-ebab891bb630",
+      "name": "Sticky Note1"
+    },
+    {
+      "parameters": {
+        "content": "Phase 3: Organize & Brief\nThis is where a single LLM call takes all the per-article summaries and produces the final briefing. Your prompt should instruct it to:\n\nGroup by topic/sector (healthcare, tech, policy, etc.)\nHighlight the most interesting/important items at the top\nInclude every article with its summary and source link\nFlag any themes that appeared across multiple newsletters\n\nOutput format decision: Markdown? HTML? PDF? I'd suggest Markdown that renders well in email, since you'll probably want this delivered to your inbox or a notes app."
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        2240,
+        -64
+      ],
+      "id": "fabe3327-1e65-4113-8893-1721f8534aaf",
+      "name": "Sticky Note2"
+    },
+    {
+      "parameters": {
+        "content": "Phase 4: Deliver\nOptions:\n\nEmail to yourself (Gmail Send node) — simplest\nSave to Google Doc — nice for archival/search\nPost to Notion/Obsidian — if you want a knowledge base\nAll of the above — the briefing is just text, easy to fan out"
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        2848,
+        32
+      ],
+      "id": "0298c30c-3226-4fa9-91d5-39e95ab1e040",
+      "name": "Sticky Note3"
+    },
+    {
+      "parameters": {
+        "content": "Retroactive Processing\nYes, this is straightforward. The approach:\nCreate a separate \"backfill\" workflow (or a branch of the same one) that:\n\nTakes a startDate and endDate as input parameters\nFetches all \"Newsletter\"-labeled emails in that window\nGroups them by date (the date they were received)\nProcesses each day's batch through the same pipeline\nProduces one briefing per day\n\nYou'd trigger this manually or with a loop that walks backward day by day. The main thing to watch: rate limits and execution time. n8n workflows have timeout limits (especially on n8n Cloud). For a big backfill:\n\nProcess one day at a time with a delay between days\nOr use n8n's \"Execute Workflow\" node to kick off sub-workflows per day\nConsider running this on self-hosted n8n if you're on Cloud, since backfills can be long-running\n\nYou'll also want to store completed briefings somewhere indexed by date so you can track progress and resume if something fails mid-backfill."
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        128,
+        128
+      ],
+      "id": "24d4626c-cc5b-4878-a066-b39c24187d11",
+      "name": "Sticky Note4"
+    },
+    {
+      "parameters": {
+        "content": "Bookmark Dumps — This Is the Interesting Problem\nThe challenge: you occasionally email yourself a huge list of URLs (50? 100?), and you don't want that to overwhelm a single day's briefing or blow up your LLM costs in one shot.\nA few approaches worth considering:\nOption A: Separate queue, drip into daily briefings. When a bookmark dump arrives, don't process it all at once. Instead, store the URLs in a queue (Google Sheet, Airtable, or even a dedicated Gmail draft). Then each day's briefing pulls N bookmarks from the queue (say 10-15) alongside the regular newsletters. This spreads the load and keeps briefings consistently sized. Downside: it could take a week to work through a big dump.\nOption B: Produce a separate \"Bookmark Digest\" document. Process the entire dump as its own thing — not a daily briefing but a \"Bookmark Review\" artifact. This could be organized by topic just like a briefing but isn't constrained to a day's cadence. You'd get a notification when it's ready.\nOption C: Hybrid — quick-triage first, then drip. When a dump comes in, do a fast pass: fetch each URL's title and meta description only (cheap, fast). Produce a \"triage list\" where you can quickly star/flag the ones you actually care about. Only the flagged ones get the full crawl-and-summarize treatment, and they drip into daily briefings.\nMy instinct is Option A is the simplest to build and keeps everything in one unified briefing format. You'd label bookmark dump emails differently (maybe \"Bookmarks\" label), and the daily workflow checks both the Newsletter label and the bookmark queue.\nFor the email format of bookmark dumps: I'd suggest just emailing yourself a plain text list of URLs, one per line, maybe with optional notes. Keep it dead simple. The workflow detects emails with the \"Bookmarks\" label, extracts URLs, appends them to the queue, and marks the email as processed."
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        464,
+        128
+      ],
+      "id": "4ca301bf-efee-4f69-974a-a3f5d7885197",
+      "name": "Sticky Note5"
+    },
+    {
+      "parameters": {
+        "content": "remove me"
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        1056,
+        -64
+      ],
+      "id": "c40784cc-d533-4199-b076-dff9a6ffb136",
+      "name": "Sticky Note6"
     }
   ],
   "connections": {
-    "Schedule Trigger": {
+    "Extract URLs": {
       "main": [
         [
           {
-            "node": "Get many messages",
+            "node": "Provide Tracking URLs w/ Context",
             "type": "main",
             "index": 0
           }
         ]
       ]
     },
-    "Get many messages": {
+    "Get Content Emails": {
       "main": [
         [
           {
-            "node": "AI Agent",
+            "node": "Extract URLs",
             "type": "main",
             "index": 0
           }
         ]
       ]
     },
-    "HTTP Request": {
-      "ai_tool": [
+    "Run Daily": {
+      "main": [
         [
           {
-            "node": "AI Agent",
-            "type": "ai_tool",
+            "node": "Get Content Emails",
+            "type": "main",
             "index": 0
           }
         ]
       ]
     },
-    "SerpAPI": {
-      "ai_tool": [
+    "Provide Tracking URLs w/ Context": {
+      "main": [
         [
           {
-            "node": "AI Agent",
-            "type": "ai_tool",
+            "node": "Split Out",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Batch scrape multiple URLs simultaneously",
+            "type": "main",
             "index": 0
           }
         ]
       ]
     },
-    "Read URL content in Jina AI": {
-      "ai_tool": [
+    "Split Out": {
+      "main": [
         [
           {
-            "node": "AI Agent",
-            "type": "ai_tool",
+            "node": "Limit",
+            "type": "main",
             "index": 0
           }
         ]
       ]
     },
-    "Google Gemini Chat Model": {
-      "ai_languageModel": [
+    "Limit": {
+      "main": [
         [
           {
-            "node": "AI Agent",
-            "type": "ai_languageModel",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "Simple Memory": {
-      "ai_memory": [
-        [
-          {
-            "node": "AI Agent",
-            "type": "ai_memory",
+            "node": "Read URL content",
+            "type": "main",
             "index": 0
           }
         ]

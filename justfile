@@ -36,6 +36,10 @@ setup:
 # Running
 # ---------------------------------------------------------------------------
 
+# Start OrbStack (Docker runtime)
+orbstack-up:
+    orbctl start
+
 # Start everything (n8n + Ollama)
 up *args:
     docker compose up -d {{args}}
