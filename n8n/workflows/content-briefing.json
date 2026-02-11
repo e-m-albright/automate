@@ -1,38 +1,25 @@
 {
-  "id": "ZwdZT2LfE9HWxRwI1mVIA",
+  "id": "BTymAQXtmUAytRGQyKGwJ",
   "name": "Content Briefing",
   "active": false,
   "nodes": [
     {
       "parameters": {
-        "jsCode": "// ============================================================\n// n8n Code Node 2: Prepare URLs for Phase 2\n// ============================================================\n// Replaces the tracking URL resolver.\n//\n// Instead of trying to resolve tracking URLs (which are blocked\n// by bot detection like PerimeterX and Akamai), this node:\n//\n// 1. Passes direct content URLs through for crawling in Phase 2\n// 2. Keeps tracking URLs as metadata for LLM context\n// 3. Deduplicates everything\n// 4. Pairs tracking URLs with their surrounding text context\n//    so the LLM can infer what they link to\n// ============================================================\n\n// --- URL normalization for dedup ---\nfunction normalizeUrl(url) {\n  try {\n    const u = new URL(url);\n    const trackingParams = [\n      'utm_source', 'utm_medium', 'utm_campaign', 'utm_content', 'utm_term',\n      'mc_cid', 'mc_eid', 'ref', 'source', 'fbclid', 'gclid',\n      'rcm', 'gaa_at', 'gaa_n', 'gaa_ts', 'gaa_sig',\n    ];\n    trackingParams.forEach(p => u.searchParams.delete(p));\n    u.hash = '';\n    return u.toString().replace(/\\/+$/, '');\n  } catch {\n    return url;\n  }\n}\n\n// --- Extract context around each tracking URL ---\n// Grabs the text surrounding a URL in the email body so the LLM\n// can figure out what the link points to.\nfunction extractUrlContext(bodyText, url, contextChars = 200) {\n  const idx = bodyText.indexOf(url);\n  if (idx === -1) return null;\n\n  const start = Math.max(0, idx - contextChars);\n  const end = Math.min(bodyText.length, idx + url.length + contextChars);\n  const snippet = bodyText.substring(start, end).trim();\n\n  // Clean up: grab the text before and after the URL\n  const before = bodyText.substring(start, idx).trim();\n  const after = bodyText.substring(idx + url.length, end).trim();\n\n  return { before, after };\n}\n\n// --- Main Processing ---\nconst results = [];\n\nfor (const item of $input.all()) {\n  const data = item.json;\n\n  // Deduplicate content URLs\n  const seen = new Set();\n  const deduplicatedContentUrls = [];\n  for (const url of (data.contentUrls || [])) {\n    const normalized = normalizeUrl(url);\n    if (!seen.has(normalized)) {\n      seen.add(normalized);\n      deduplicatedContentUrls.push(url);\n    }\n  }\n\n  // Build tracking URL context for the LLM\n  const trackingUrlsWithContext = [];\n  const trackingSeen = new Set();\n\n  for (const url of (data.trackingUrls || [])) {\n    // Basic dedup on tracking URLs (exact match since we can't normalize these)\n    if (trackingSeen.has(url)) continue;\n    trackingSeen.add(url);\n\n    const context = extractUrlContext(data.bodyText || '', url);\n    trackingUrlsWithContext.push({\n      url: url,\n      contextBefore: context?.before || '',\n      contextAfter: context?.after || '',\n    });\n  }\n\n  results.push({\n    json: {\n      emailId: data.emailId,\n      threadId: data.threadId,\n      receivedDate: data.receivedDate,\n      sender: data.sender,\n      senderEmail: data.senderEmail,\n      subject: data.subject,\n      bodyText: data.bodyText,\n      bodyWordCount: data.bodyWordCount,\n      newsletterType: data.newsletterType,\n\n      // Direct URLs we can actually crawl in Phase 2\n      contentUrls: deduplicatedContentUrls,\n\n      // Tracking URLs with surrounding text for LLM inference\n      trackingUrlsWithContext: trackingUrlsWithContext,\n\n      urlStats: {\n        totalExtracted: data.totalUrlsFound,\n        junkFiltered: data.junkUrlsFiltered,\n        directContentUrls: deduplicatedContentUrls.length,\n        unresolvedTrackingUrls: trackingUrlsWithContext.length,\n      },\n    }\n  });\n}\n\nreturn results;"
+        "jsCode": "// ============================================================\n// n8n Code Node: Extract, Classify & Contextualize URLs\n// ============================================================\n// Single node that handles all URL preprocessing:\n//   1. Extracts URLs from plaintext and HTML email bodies\n//   2. Filters junk (unsub links, pixels, assets, etc.)\n//   3. Identifies tracking/redirect wrappers\n//   4. Deduplicates with URL normalization\n//   5. Extracts surrounding text context for ALL URLs\n//   6. Formats everything for the downstream AI Agent\n//\n// Input:  Gmail node output (each item = one email, post pre-filter)\n// Output: One item per email with classified, contextualized URLs\n//         ready for the AI Agent batch prompt\n// ============================================================\n\n// --- Configuration ---\n\nconst URL_CONTEXT_CHARS = 200; // chars before/after each URL to grab\n\nconst JUNK_URL_PATTERNS = [\n  // Unsubscribe / email management\n  /unsubscribe/i,\n  /email[-_]?pref/i,\n  /manage[-_]?pref/i,\n  /opt[-_]?out/i,\n  /email[-_]?settings/i,\n  /subscription[-_]?manage/i,\n\n  // Privacy / legal\n  /\\/privacy/i,\n  /\\/terms/i,\n  /\\/legal/i,\n  /\\/cookie/i,\n  /\\/gdpr/i,\n\n  // Social sharing widgets (not content)\n  /facebook\\.com\\/sharer/i,\n  /twitter\\.com\\/intent/i,\n  /linkedin\\.com\\/share/i,\n  /api\\.whatsapp\\.com/i,\n  /pinterest\\.com\\/pin\\/create/i,\n\n  // App stores\n  /apps\\.apple\\.com/i,\n  /play\\.google\\.com\\/store/i,\n  /itunes\\.apple\\.com/i,\n\n  // Image / media assets\n  /\\.(png|jpg|jpeg|gif|webp|svg|ico|bmp)(\\?.*)?$/i,\n  /cdn-cgi\\/image/i,\n  /media\\.beehiiv\\.com\\/cdn-cgi/i,\n\n  // Fonts, stylesheets, scripts\n  /fonts\\.googleapis\\.com/i,\n  /fonts\\.gstatic\\.com/i,\n  /\\.css(\\?.*)?$/i,\n  /\\.js(\\?.*)?$/i,\n  /\\.woff2?(\\?.*)?$/i,\n\n  // Tracking pixels / beacons\n  /\\/track\\//i,\n  /\\/beacon\\//i,\n  /\\/pixel/i,\n  /\\/open\\//i,\n  /\\/wf\\/open/i,\n  /width=[\"']?1[\"']?.*height=[\"']?1[\"']?/i,\n\n  // Mail protocols\n  /^mailto:/i,\n  /^tel:/i,\n\n  // Common newsletter platform junk\n  /beehiiv\\.com\\/subscribe/i,\n  /substack\\.com\\/subscribe/i,\n  /list-manage\\.com/i,\n  /mailchimp\\.com\\/.*\\/update-profile/i,\n\n  // Empty or fragment-only\n  /^#/,\n  /^$/,\n];\n\n// Social URLs that ARE content (specific posts, not profiles)\nconst SOCIAL_CONTENT_PATTERNS = [\n  /instagram\\.com\\/p\\//i,\n  /youtube\\.com\\/watch/i,\n  /youtu\\.be\\//i,\n  /open\\.spotify\\.com/i,\n  /tiktok\\.com\\/@.*\\/video/i,\n];\n\n// Known tracking/redirect wrappers\nconst TRACKING_REDIRECT_PATTERNS = [\n  /clicks\\..+\\.(com|org|io)/i,\n  /click\\..+\\.(com|org|io)/i,\n  /links\\..+\\.(com|org|io)/i,\n  /email\\..+\\.com\\/.*click/i,\n  /trk\\./i,\n  /go\\..+\\.(com|org|io)/i,\n  /t\\.co\\//i,\n  /bit\\.ly\\//i,\n  /buff\\.ly\\//i,\n  /ow\\.ly\\//i,\n  /mailchimp\\.com\\/track\\/click/i,\n  /list-manage\\.com\\/track\\/click/i,\n  /beehiiv\\.com\\/.*\\/clicks/i,\n  /substack\\.com\\/redirect/i,\n];\n\n// Self-referential homepages (add your newsletter sender domains)\nconst HOMEPAGE_PATTERNS = [\n  /^https?:\\/\\/(www\\.)?babylist\\.com\\/?$/i,\n  /^https?:\\/\\/(www\\.)?babylist\\.com\\/store\\/?$/i,\n  /^https?:\\/\\/(www\\.)?solidstarts\\.com\\/?$/i,\n  /^https?:\\/\\/(www\\.)?healthtechnerds\\.com\\/?$/i,\n];\n\n// --- Helpers ---\n\nfunction extractUrlsFromPlaintext(text) {\n  if (!text) return [];\n  const urlRegex = /https?:\\/\\/[^\\s)<>\\]\"',]+/gi;\n  const matches = text.match(urlRegex) || [];\n  return matches.map(url => {\n    url = url.replace(/[.,;:!?)]+$/, '');\n    const openParens = (url.match(/\\(/g) || []).length;\n    const closeParens = (url.match(/\\)/g) || []).length;\n    if (closeParens > openParens) {\n      url = url.replace(/\\)+$/, '');\n    }\n    return url;\n  });\n}\n\nfunction extractUrlsFromHtml(html) {\n  if (!html) return [];\n  const hrefRegex = /href=[\"'](https?:\\/\\/[^\"']+)[\"']/gi;\n  const urls = [];\n  let match;\n  while ((match = hrefRegex.exec(html)) !== null) {\n    // Decode HTML entities in URLs\n    const decoded = match[1]\n      .replace(/&amp;/g, '&')\n      .replace(/&lt;/g, '<')\n      .replace(/&gt;/g, '>')\n      .replace(/&quot;/g, '\"')\n      .replace(/&#39;/g, \"'\")\n      .replace(/&#x27;/g, \"'\")\n      .replace(/&#(\\d+);/g, (_, code) => String.fromCharCode(code));\n    urls.push(decoded);\n  }\n  return urls;\n}\n\n/**\n * Extract anchor text and surrounding context from HTML for a given URL.\n * Returns { anchorText, before, after } where:\n *   - anchorText: the clickable text of the link (most useful signal)\n *   - before: text content preceding the link\n *   - after: text content following the link\n */\nfunction extractHtmlContext(html, url, contextChars = URL_CONTEXT_CHARS) {\n  if (!html) return null;\n\n  // Escape URL for use in regex\n  const escapedUrl = url.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\\\$&');\n\n  // Try to find the <a> tag containing this URL and grab its inner text\n  const anchorRegex = new RegExp(\n    `<a[^>]*href=[\"']${escapedUrl}[\"'][^>]*>(.*?)<\\\\/a>`,\n    'is'\n  );\n  const anchorMatch = html.match(anchorRegex);\n  const anchorText = anchorMatch\n    ? anchorMatch[1].replace(/<[^>]+>/g, '').replace(/\\s+/g, ' ').trim()\n    : null;\n\n  // For before/after, strip HTML to text and find the URL or anchor text\n  const plainified = html\n    .replace(/<style[^>]*>[\\s\\S]*?<\\/style>/gi, '')\n    .replace(/<script[^>]*>[\\s\\S]*?<\\/script>/gi, '')\n    .replace(/<[^>]+>/g, ' ')\n    .replace(/&nbsp;/g, ' ')\n    .replace(/&amp;/g, '&')\n    .replace(/&lt;/g, '<')\n    .replace(/&gt;/g, '>')\n    .replace(/&quot;/g, '\"')\n    .replace(/&#039;/g, \"'\")\n    .replace(/\\s+/g, ' ')\n    .trim();\n\n  // Search for anchor text in plainified content (better signal than URL)\n  const searchTerm = anchorText || url;\n  const idx = plainified.indexOf(searchTerm);\n  if (idx === -1) return { anchorText, before: '', after: '' };\n\n  const start = Math.max(0, idx - contextChars);\n  const end = Math.min(plainified.length, idx + searchTerm.length + contextChars);\n\n  return {\n    anchorText: anchorText || null,\n    before: plainified.substring(start, idx).trim(),\n    after: plainified.substring(idx + searchTerm.length, end).trim(),\n  };\n}\n\n/**\n * Extract context from plaintext body for a given URL.\n */\nfunction extractPlaintextContext(text, url, contextChars = URL_CONTEXT_CHARS) {\n  if (!text) return null;\n  const idx = text.indexOf(url);\n  if (idx === -1) return null;\n\n  const start = Math.max(0, idx - contextChars);\n  const end = Math.min(text.length, idx + url.length + contextChars);\n\n  return {\n    before: text.substring(start, idx).trim(),\n    after: text.substring(idx + url.length, end).trim(),\n  };\n}\n\nfunction normalizeUrl(url) {\n  try {\n    const u = new URL(url);\n    const trackingParams = [\n      'utm_source', 'utm_medium', 'utm_campaign', 'utm_content', 'utm_term',\n      'mc_cid', 'mc_eid', 'ref', 'source', 'fbclid', 'gclid',\n      'rcm', 'gaa_at', 'gaa_n', 'gaa_ts', 'gaa_sig',\n    ];\n    trackingParams.forEach(p => u.searchParams.delete(p));\n    u.hash = '';\n    return u.toString().replace(/\\/+$/, '');\n  } catch {\n    return url;\n  }\n}\n\nfunction isJunkUrl(url) {\n  if (HOMEPAGE_PATTERNS.some(p => p.test(url))) return true;\n  if (JUNK_URL_PATTERNS.some(p => p.test(url))) {\n    if (SOCIAL_CONTENT_PATTERNS.some(p => p.test(url))) return false;\n    return true;\n  }\n  return false;\n}\n\nfunction isTrackingRedirect(url) {\n  return TRACKING_REDIRECT_PATTERNS.some(p => p.test(url));\n}\n\nfunction getBodyText(item) {\n  if (item.json.text) return item.json.text;\n  if (item.json.html) {\n    return item.json.html\n      .replace(/<style[^>]*>[\\s\\S]*?<\\/style>/gi, '')\n      .replace(/<script[^>]*>[\\s\\S]*?<\\/script>/gi, '')\n      .replace(/<[^>]+>/g, ' ')\n      .replace(/&nbsp;/g, ' ')\n      .replace(/&amp;/g, '&')\n      .replace(/&lt;/g, '<')\n      .replace(/&gt;/g, '>')\n      .replace(/&quot;/g, '\"')\n      .replace(/&#039;/g, \"'\")\n      .replace(/\\s+/g, ' ')\n      .trim();\n  }\n  return '';\n}\n\n/**\n * Format the URL list into the text block the agent prompt expects.\n * Each URL gets an index and its best available context.\n */\nfunction formatUrlsForAgent(urls) {\n  return urls.map((u, i) => {\n    const parts = [`[${i}] ${u.url}`];\n\n    if (u.type === 'tracking') parts.push(`  ⚠️ tracking redirect — may need search fallback`);\n    if (u.anchorText) parts.push(`  link text: \"${u.anchorText}\"`);\n\n    // Build a context snippet from before + after\n    const contextParts = [];\n    if (u.contextBefore) contextParts.push(u.contextBefore.slice(-120));\n    if (u.contextAfter) contextParts.push(u.contextAfter.slice(0, 120));\n    if (contextParts.length > 0) {\n      parts.push(`  context: ...${contextParts.join(' [...] ')}...`);\n    }\n\n    return parts.join('\\n');\n  }).join('\\n\\n');\n}\n\n// --- Main Processing ---\n\nconst results = [];\n\nfor (const item of $('Get Content Emails').all()) {\n  const bodyText = getBodyText(item);\n  const htmlBody = item.json.html || '';\n\n  // 1. Extract raw URLs from both sources\n  const plaintextUrls = extractUrlsFromPlaintext(item.json.text);\n  const htmlUrls = extractUrlsFromHtml(htmlBody);\n  const allRawUrls = [...new Set([...plaintextUrls, ...htmlUrls])];\n\n  // 2. Classify, deduplicate, and enrich with context\n  const seen = new Set();\n  const processedUrls = [];  // URLs for the agent (content + tracking)\n  let junkCount = 0;\n\n  for (const url of allRawUrls) {\n    // Junk filter\n    if (isJunkUrl(url)) {\n      junkCount++;\n      continue;\n    }\n\n    // Dedup via normalization\n    const normalized = normalizeUrl(url);\n    if (seen.has(normalized)) continue;\n    seen.add(normalized);\n\n    // Classify\n    const isTracking = isTrackingRedirect(url);\n\n    // Extract context — prefer HTML (has anchor text), fall back to plaintext\n    const htmlCtx = extractHtmlContext(htmlBody, url);\n    const textCtx = extractPlaintextContext(bodyText, url);\n\n    // Use the richest context available\n    const anchorText = htmlCtx?.anchorText || null;\n    const contextBefore = htmlCtx?.before || textCtx?.before || '';\n    const contextAfter = htmlCtx?.after || textCtx?.after || '';\n\n    processedUrls.push({\n      url: url,\n      type: isTracking ? 'tracking' : 'content',\n      anchorText: anchorText,\n      contextBefore: contextBefore,\n      contextAfter: contextAfter,\n    });\n  }\n\n  // 3. Build email metadata\n  const senderEmail = item.json.from?.value?.[0]?.address\n    || item.json.from?.text\n    || 'unknown';\n  const senderName = item.json.from?.value?.[0]?.name\n    || senderEmail.split('@')[0]\n    || 'unknown';\n  const wordCount = bodyText.split(/\\s+/).filter(w => w.length > 0).length;\n\n  // 4. Stats\n  const contentCount = processedUrls.filter(u => u.type === 'content').length;\n  const trackingCount = processedUrls.filter(u => u.type === 'tracking').length;\n\n  results.push({\n    json: {\n      // Email identity\n      emailId: item.json.id || '',\n      threadId: item.json.threadId || '',\n      receivedDate: item.json.date || '',\n      sender: senderName,\n      senderEmail: senderEmail,\n      subject: item.json.subject || '',\n\n      // Body (for reference / downstream use)\n      bodyText: bodyText,\n      bodyWordCount: wordCount,\n\n      // All URLs for the agent, with context\n      urls: processedUrls,\n\n      // Pre-formatted string for the agent prompt\n      urlsFormatted: formatUrlsForAgent(processedUrls),\n\n      // Stats\n      urlStats: {\n        totalExtracted: allRawUrls.length,\n        junkFiltered: junkCount,\n        contentUrls: contentCount,\n        trackingUrls: trackingCount,\n        totalForAgent: processedUrls.length,\n      },\n    }\n  });\n}\n\nreturn results;"
       },
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
-        672,
-        -96
+        -400,
+        208
       ],
-      "id": "e7498b7b-ae9e-47bf-a406-3a244113094c",
-      "name": "Provide Tracking URLs w/ Context"
-    },
-    {
-      "parameters": {
-        "jsCode": "// ============================================================\n// n8n Code Node 1: Extract & Classify URLs from Email Body\n// ============================================================\n// Input: Gmail node output (each item = one email)\n// Output: One item per email with extracted/classified URLs\n//\n// Expects each input item to have:\n//   - json.id           (Gmail message ID)\n//   - json.labelIds     (array of label IDs)\n//   - json.date         (received date)\n//   - json.from.value[0].address  (sender email)\n//   - json.from.value[0].name     (sender name)\n//   - json.subject\n//   - json.textPlain    (plaintext body — preferred)\n//   - json.textHtml     (HTML body — fallback)\n// ============================================================\n\n// --- Configuration ---\n\nconst JUNK_URL_PATTERNS = [\n  // Unsubscribe / email management\n  /unsubscribe/i,\n  /email[-_]?pref/i,\n  /manage[-_]?pref/i,\n  /opt[-_]?out/i,\n  /email[-_]?settings/i,\n  /subscription[-_]?manage/i,\n\n  // Privacy / legal\n  /\\/privacy/i,\n  /\\/terms/i,\n  /\\/legal/i,\n  /\\/cookie/i,\n  /\\/gdpr/i,\n\n  // Social sharing (not content)\n  /facebook\\.com\\/sharer/i,\n  /twitter\\.com\\/intent/i,\n  /linkedin\\.com\\/share/i,\n  /api\\.whatsapp\\.com/i,\n  /pinterest\\.com\\/pin\\/create/i,\n\n  // App stores\n  /apps\\.apple\\.com/i,\n  /play\\.google\\.com\\/store/i,\n  /itunes\\.apple\\.com/i,\n\n  // Image/media assets (not articles)\n  /\\.(png|jpg|jpeg|gif|webp|svg|ico|bmp)(\\?.*)?$/i,\n  /cdn-cgi\\/image/i,\n  /media\\.beehiiv\\.com\\/cdn-cgi/i,\n\n  // Fonts, stylesheets, scripts (not content)\n  /fonts\\.googleapis\\.com/i,\n  /fonts\\.gstatic\\.com/i,\n  /\\.css(\\?.*)?$/i,\n  /\\.js(\\?.*)?$/i,\n  /\\.woff2?(\\?.*)?$/i,\n\n  // Tracking pixels / beacons\n  /\\/track\\//i,\n  /\\/beacon\\//i,\n  /\\/pixel/i,\n  /\\/open\\//i,\n  /\\/wf\\/open/i,\n  /width=[\"']?1[\"']?.*height=[\"']?1[\"']?/i,\n\n  // Mail protocols\n  /^mailto:/i,\n  /^tel:/i,\n\n  // Common newsletter platform junk\n  /beehiiv\\.com\\/subscribe/i,\n  /substack\\.com\\/subscribe/i,\n  /list-manage\\.com/i,\n  /mailchimp\\.com\\/.*\\/update-profile/i,\n\n  // Google forms (surveys, not content — adjust if you want these)\n  // /docs\\.google\\.com\\/forms/i,\n\n  // Empty or fragment-only\n  /^#/,\n  /^$/,\n];\n\n// Domains where social posts ARE content (e.g., Instagram posts linked from newsletters)\n// You can toggle these. By default we keep them as some newsletters link to\n// meaningful Instagram content (like Babylist linking Emily Oster posts).\nconst SOCIAL_CONTENT_DOMAINS = [\n  /instagram\\.com\\/p\\//i,     // specific Instagram posts (often content)\n  /youtube\\.com\\/watch/i,     // YouTube videos\n  /youtu\\.be\\//i,\n  /open\\.spotify\\.com/i,      // podcast episodes\n  /tiktok\\.com\\/@.*\\/video/i, // specific TikTok videos\n];\n\n// Known tracking/redirect domains that wrap real URLs\nconst TRACKING_REDIRECT_PATTERNS = [\n  /clicks\\..+\\.(com|org|io)/i,       // e.g., clicks.hi.solidstarts.com\n  /click\\..+\\.(com|org|io)/i,\n  /links\\..+\\.(com|org|io)/i,        // e.g., links.babylist.com\n  /email\\..+\\.com\\/.*click/i,\n  /trk\\./i,\n  /go\\..+\\.(com|org|io)/i,\n  /t\\.co\\//i,                         // Twitter shortener\n  /bit\\.ly\\//i,\n  /buff\\.ly\\//i,\n  /ow\\.ly\\//i,\n  /mailchimp\\.com\\/track\\/click/i,\n  /list-manage\\.com\\/track\\/click/i,\n  /beehiiv\\.com\\/.*\\/clicks/i,\n  /substack\\.com\\/redirect/i,\n];\n\n// Self-referential / homepage links to skip (newsletter's own domain, not articles)\n// Add your newsletter domains here if they link to their own homepages a lot\nconst HOMEPAGE_PATTERNS = [\n  /^https?:\\/\\/(www\\.)?babylist\\.com\\/?$/i,\n  /^https?:\\/\\/(www\\.)?babylist\\.com\\/store\\/?$/i,\n  /^https?:\\/\\/(www\\.)?solidstarts\\.com\\/?$/i,\n  /^https?:\\/\\/(www\\.)?healthtechnerds\\.com\\/?$/i,\n];\n\n// --- Helper Functions ---\n\nfunction extractUrlsFromPlaintext(text) {\n  if (!text) return [];\n  // Match URLs, handling common wrapping patterns:\n  // - Bare URLs on lines\n  // - URLs in parentheses: (https://...)\n  // - URLs in angle brackets: <https://...>\n  const urlRegex = /https?:\\/\\/[^\\s)<>\\]\"',]+/gi;\n  const matches = text.match(urlRegex) || [];\n\n  // Clean trailing punctuation that gets captured\n  return matches.map(url => {\n    // Remove trailing periods, commas, semicolons that aren't part of the URL\n    url = url.replace(/[.,;:!?)]+$/, '');\n    // Remove trailing parentheses only if unbalanced\n    const openParens = (url.match(/\\(/g) || []).length;\n    const closeParens = (url.match(/\\)/g) || []).length;\n    if (closeParens > openParens) {\n      url = url.replace(/\\)+$/, '');\n    }\n    return url;\n  });\n}\n\nfunction extractUrlsFromHtml(html) {\n  if (!html) return [];\n  // Extract href values from anchor tags\n  const hrefRegex = /href=[\"'](https?:\\/\\/[^\"']+)[\"']/gi;\n  const urls = [];\n  let match;\n  while ((match = hrefRegex.exec(html)) !== null) {\n    urls.push(match[1]);\n  }\n  return urls;\n}\n\nfunction isJunkUrl(url) {\n  // Check homepage patterns\n  if (HOMEPAGE_PATTERNS.some(pattern => pattern.test(url))) return true;\n\n  // Check junk patterns\n  if (JUNK_URL_PATTERNS.some(pattern => pattern.test(url))) {\n    // Exception: social content links that ARE worth keeping\n    if (SOCIAL_CONTENT_DOMAINS.some(pattern => pattern.test(url))) {\n      return false;\n    }\n    return true;\n  }\n  return false;\n}\n\nfunction isTrackingRedirect(url) {\n  return TRACKING_REDIRECT_PATTERNS.some(pattern => pattern.test(url));\n}\n\nfunction classifyUrl(url) {\n  if (isJunkUrl(url)) return 'junk';\n  if (isTrackingRedirect(url)) return 'tracking';\n  return 'content';\n}\n\nfunction getBodyText(item) {\n  // Prefer plaintext, fall back to HTML with basic tag stripping\n  if (item.json.text) {\n    return item.json.text;\n  }\n  if (item.json.html) {\n    // Basic HTML → text conversion (the LLM will handle this well enough)\n    return item.json.textHtml\n      .replace(/<style[^>]*>[\\s\\S]*?<\\/style>/gi, '')\n      .replace(/<script[^>]*>[\\s\\S]*?<\\/script>/gi, '')\n      .replace(/<[^>]+>/g, ' ')\n      .replace(/&nbsp;/g, ' ')\n      .replace(/&amp;/g, '&')\n      .replace(/&lt;/g, '<')\n      .replace(/&gt;/g, '>')\n      .replace(/&quot;/g, '\"')\n      .replace(/&#039;/g, \"'\")\n      .replace(/\\s+/g, ' ')\n      .trim();\n  }\n  return '';\n}\n\n// --- Main Processing ---\n\nconst results = [];\n\nfor (const item of $input.all()) {\n  const bodyText = getBodyText(item);\n\n  // Extract URLs from both plaintext and HTML if available\n  const plaintextUrls = extractUrlsFromPlaintext(item.json.text);\n  const htmlUrls = extractUrlsFromHtml(item.json.html);\n\n  // Merge and deduplicate raw URLs\n  const allRawUrls = [...new Set([...plaintextUrls, ...htmlUrls])];\n\n  // Classify each URL\n  const contentUrls = [];\n  const trackingUrls = [];\n  let junkCount = 0;\n\n  for (const url of allRawUrls) {\n    const classification = classifyUrl(url);\n    if (classification === 'content') {\n      contentUrls.push(url);\n    } else if (classification === 'tracking') {\n      trackingUrls.push(url);\n    } else {\n      junkCount++;\n    }\n  }\n\n  // Deduplicate content and tracking URLs\n  const uniqueContentUrls = [...new Set(contentUrls)] || [];\n  const uniqueTrackingUrls = [...new Set(trackingUrls)] || [];\n\n  // Estimate newsletter type based on body text length\n  const wordCount = bodyText.split(/\\s+/).filter(w => w.length > 0).length;\n  const newsletterType = wordCount > 500 ? 'editorial' : 'roundup';\n\n  // Extract sender info safely\n  const senderEmail = item.json.from?.value?.[0]?.address\n    || item.json.from?.text\n    || 'unknown';\n  const senderName = item.json.from?.value?.[0]?.name\n    || senderEmail.split('@')[0]\n    || 'unknown';\n\n  results.push({\n    json: {\n      emailId: item.json.id || '',\n      threadId: item.json.threadId || '',\n      receivedDate: item.json.date || '',\n      sender: senderName,\n      senderEmail: senderEmail,\n      subject: item.json.subject || '',\n      bodyText: bodyText || '',\n      bodyWordCount: wordCount,\n      newsletterType: newsletterType,\n      contentUrls: uniqueContentUrls.length > 0 ? uniqueContentUrls : [],\n      trackingUrls: uniqueTrackingUrls.length > 0 ? uniqueTrackingUrls : [],\n      totalUrlsFound: allRawUrls.length || 0,\n      junkUrlsFiltered: junkCount || 0,\n    }\n  });\n}\n\nreturn results;"
-      },
-      "type": "n8n-nodes-base.code",
-      "typeVersion": 2,
-      "position": [
-        448,
-        -96
-      ],
-      "id": "c98b6a12-bb54-4c3b-aaf1-91dca5c2f99e",
+      "id": "af8f28df-0009-4128-956f-3ab2361729de",
       "name": "Extract URLs"
     },
     {
       "parameters": {
         "operation": "getAll",
-        "limit": 3,
+        "limit": 10,
         "simple": false,
         "filters": {
           "labelIds": [
@@ -44,10 +31,10 @@
       "type": "n8n-nodes-base.gmail",
       "typeVersion": 2.2,
       "position": [
-        224,
-        -96
+        -1344,
+        384
       ],
-      "id": "704d85ec-763d-45f7-a0fb-83183aeae54a",
+      "id": "6af74f24-70c5-4b54-b554-9c1336b472cf",
       "name": "Get Content Emails",
       "webhookId": "9d2e82bc-260a-43b4-8413-3bf0e6312c79"
     },
@@ -64,180 +51,676 @@
       "type": "n8n-nodes-base.scheduleTrigger",
       "typeVersion": 1.3,
       "position": [
-        0,
-        -96
+        -1568,
+        384
       ],
-      "id": "e8f40fec-5aba-4a78-84d7-8f7f3e379972",
+      "id": "46fec4b5-c0c7-42a5-8767-35f8b11bfe4d",
       "name": "Run Daily"
     },
     {
       "parameters": {
-        "fieldToSplitOut": "contentUrls",
-        "include": "selectedOtherFields",
-        "fieldsToInclude": "emailId",
-        "options": {}
+        "content": "Phase 2: Crawl & Summarize\nFor each extracted URL, you need to:\n\nFetch the page content — n8n's HTTP Request node can do this, but many sites return JS-rendered pages that won't have content in the raw HTML. Options:\n\nHTTP Request node (fast, free, works for most editorial content)\nA headless browser service like Browserless or ScrapingBee if you hit JS-heavy sites\nStart with HTTP Request and only escalate if you're getting empty bodies\n\n\nExtract readable content — You need something like Readability (Mozilla's algorithm) to strip nav, ads, sidebars and get the article text. You can do this in a Code node using a library, or just pass the raw HTML to an LLM and ask it to extract the article content (works surprisingly well but burns tokens).\nSummarize — Send extracted text to Claude/GPT via an AI node. Per-article summaries should capture: headline, key points, why it matters, and any notable data/quotes.\n\nKey decision: Summarize per-article or batch? I'd recommend per-article summaries first, then a final synthesis pass. This gives you granularity and also lets the final pass do the topic clustering with full context.\nRate limiting matters here. If a newsletter has 15 links and you're processing 10 newsletters, that's 150 HTTP requests + 150 LLM calls. You'll want:\n\nA reasonable concurrency limit (don't blast 150 requests simultaneously)\nError handling for 403s, timeouts, paywalled content\nA fallback for paywalled articles (just note \"paywalled — title only\" in the briefing)",
+        "height": 592,
+        "width": 848
       },
-      "type": "n8n-nodes-base.splitOut",
+      "type": "n8n-nodes-base.stickyNote",
       "typeVersion": 1,
       "position": [
-        896,
-        0
+        688,
+        -528
       ],
-      "id": "3adee929-659a-4b3b-9ba5-7bef47d90f18",
-      "name": "Split Out"
+      "id": "6f8cdc69-a83a-47de-a6f8-4f3ef7c553e1",
+      "name": "Sticky Note1"
     },
     {
       "parameters": {
-        "url": "https://clicks.hi.solidstarts.com/f/a/l_UTkPAH3OXHQ9z8ojZyVw~~/AAQRxRA~/iBrAAwWZAfWEyVrXNhEaw-nJaJPZbp-1UDFigWwCLB7DbwhMBaJMzOx1HljeHydKQ9RnPyRM5936PdREcQRNBRSBnpk3ZYa12wFr-U4UJecL00XUiGyLbUJr0lIpi2t-I9wQggPaLm64gL-K_tP2MKAKb9q_cKe3AT7E5WxnxSQ~",
+        "content": "Phase 3: Organize & Brief\nThis is where a single LLM call takes all the per-article summaries and produces the final briefing. Your prompt should instruct it to:\n\nGroup by topic/sector (healthcare, tech, policy, etc.)\nHighlight the most interesting/important items at the top\nInclude every article with its summary and source link\nFlag any themes that appeared across multiple newsletters\n\nOutput format decision: Markdown? HTML? PDF? I'd suggest Markdown that renders well in email, since you'll probably want this delivered to your inbox or a notes app.",
+        "height": 352,
+        "width": 960
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        1744,
+        -448
+      ],
+      "id": "41221f76-b494-4d18-b80f-6ddfaae77374",
+      "name": "Sticky Note2"
+    },
+    {
+      "parameters": {
+        "content": "Phase 4: Deliver\nOptions:\n\nEmail to yourself (Gmail Send node) — simplest\nSave to Google Doc — nice for archival/search\nPost to Notion/Obsidian — if you want a knowledge base\nAll of the above — the briefing is just text, easy to fan out",
+        "height": 256,
+        "width": 464
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        2864,
+        -144
+      ],
+      "id": "42388313-cd63-49ff-81b1-84e72e6614f9",
+      "name": "Sticky Note3"
+    },
+    {
+      "parameters": {
+        "content": "Retroactive Processing\nYes, this is straightforward. The approach:\nCreate a separate \"backfill\" workflow (or a branch of the same one) that:\n\nTakes a startDate and endDate as input parameters\nFetches all \"Newsletter\"-labeled emails in that window\nGroups them by date (the date they were received)\nProcesses each day's batch through the same pipeline\nProduces one briefing per day\n\nYou'd trigger this manually or with a loop that walks backward day by day. The main thing to watch: rate limits and execution time. n8n workflows have timeout limits (especially on n8n Cloud). For a big backfill:\n\nProcess one day at a time with a delay between days\nOr use n8n's \"Execute Workflow\" node to kick off sub-workflows per day\nConsider running this on self-hosted n8n if you're on Cloud, since backfills can be long-running\n\nYou'll also want to store completed briefings somewhere indexed by date so you can track progress and resume if something fails mid-backfill.",
+        "height": 416,
+        "width": 784
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -2032,
+        576
+      ],
+      "id": "82991b4e-5632-4e9c-833f-b085db4d3f84",
+      "name": "Sticky Note4"
+    },
+    {
+      "parameters": {
+        "content": "Bookmark Dumps — This Is the Interesting Problem\nThe challenge: you occasionally email yourself a huge list of URLs (50? 100?), and you don't want that to overwhelm a single day's briefing or blow up your LLM costs in one shot.\nA few approaches worth considering:\nOption A: Separate queue, drip into daily briefings. When a bookmark dump arrives, don't process it all at once. Instead, store the URLs in a queue (Google Sheet, Airtable, or even a dedicated Gmail draft). Then each day's briefing pulls N bookmarks from the queue (say 10-15) alongside the regular newsletters. This spreads the load and keeps briefings consistently sized. Downside: it could take a week to work through a big dump.\nOption B: Produce a separate \"Bookmark Digest\" document. Process the entire dump as its own thing — not a daily briefing but a \"Bookmark Review\" artifact. This could be organized by topic just like a briefing but isn't constrained to a day's cadence. You'd get a notification when it's ready.\nOption C: Hybrid — quick-triage first, then drip. When a dump comes in, do a fast pass: fetch each URL's title and meta description only (cheap, fast). Produce a \"triage list\" where you can quickly star/flag the ones you actually care about. Only the flagged ones get the full crawl-and-summarize treatment, and they drip into daily briefings.\nMy instinct is Option A is the simplest to build and keeps everything in one unified briefing format. You'd label bookmark dump emails differently (maybe \"Bookmarks\" label), and the daily workflow checks both the Newsletter label and the bookmark queue.\nFor the email format of bookmark dumps: I'd suggest just emailing yourself a plain text list of URLs, one per line, maybe with optional notes. Keep it dead simple. The workflow detects emails with the \"Bookmarks\" label, extracts URLs, appends them to the queue, and marks the email as processed.",
+        "height": 640,
+        "width": 944
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -2208,
+        -288
+      ],
+      "id": "0d80b7b4-be1b-4cb7-b87b-a8ab1ea0c58b",
+      "name": "Sticky Note5"
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatGoogleGemini",
+      "typeVersion": 1,
+      "position": [
+        -1120,
+        608
+      ],
+      "id": "092deba6-5d2c-4240-9362-d522a560768c",
+      "name": "Gemini Email Quality Filter"
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatGoogleGemini",
+      "typeVersion": 1,
+      "position": [
+        -912,
+        816
+      ],
+      "id": "5247731b-8793-43de-b40e-8e8c21cc67c1",
+      "name": "Gemini Email Quality Filter Structuring"
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=Classify this email:\n\nSender: {{ $json.from.text }}\nSubject: {{ $json.subject }}\nText: {{ $json.text }}",
+        "hasOutputParser": true,
+        "messages": {
+          "messageValues": [
+            {
+              "message": "You are an email triage classifier for a daily content briefing pipeline.\n\nYou receive the full email (sender, subject, text) and classify the email into exactly one of these categories:\n\n**visit** — Email contains content worth processing:\n- Newsletters with editorial content, analysis, or news\n- Industry updates, research, reports\n- Product announcements, changelogs, technical posts\n- Content related to: AI/ML, finance, startups, healthcare/pharma, SaaS, software engineering, technology news\n- Content related to: parenting, health/fitness, cooking, travel, personal finance\n- Any email with substantive informational content\n\n**skip** — Email is low-value promotional noise (suggest unsubscribe):\n- Ticket sales, event marketing (Ticketmaster, StubHub, etc.)\n- Retail promotions, deals, coupons, flash sales\n- Social media notifications (LinkedIn \"you appeared in X searches\", etc.)\n- Political fundraising / campaign emails\n- Pure advertising with no editorial content\n- Loyalty program updates, rewards spam\n- Transactional emails (receipts, shipping confirmations, password resets)\n- Account notifications with no informational value\n\nWhen in doubt, classify as **visit** — we'd rather process something marginal than miss something good."
+            }
+          ]
+        },
+        "batching": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.chainLlm",
+      "typeVersion": 1.9,
+      "position": [
+        -1088,
+        384
+      ],
+      "id": "d27e2eef-06fb-4804-b561-a42700ad394f",
+      "name": "Email Quality Filter"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "7178df9d-8b18-44e7-9bd8-4aedb6c461d9",
+              "leftValue": "={{ $json.output.category }}",
+              "rightValue": "visit",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        -624,
+        384
+      ],
+      "id": "377e9ae0-d205-46cf-95cb-f0699cc65951",
+      "name": "Include Email?"
+    },
+    {
+      "parameters": {
+        "url": "={{ $('Split Out URLs').item.json.urls.url }}",
         "options": {},
         "requestOptions": {}
       },
       "type": "n8n-nodes-base.jinaAi",
       "typeVersion": 1,
       "position": [
-        1344,
-        0
+        992,
+        32
       ],
-      "id": "a5fb789a-a069-4bb8-84d6-1ba9f8034bd7",
-      "name": "Read URL content"
+      "id": "c40fb2b6-abd4-443f-b946-bfe3c2fd0ba5",
+      "name": "Read URL Content"
     },
     {
       "parameters": {
-        "operation": "scrape",
-        "requestOptions": {}
+        "content": "Tracking URLs getting filtered here - ok or not? context doesn't help..."
       },
-      "type": "@mendable/n8n-nodes-firecrawl.firecrawl",
+      "type": "n8n-nodes-base.stickyNote",
       "typeVersion": 1,
       "position": [
-        1344,
-        176
+        288,
+        -32
       ],
-      "id": "c72d90bb-f6ba-405f-9c9e-148083b4e6c4",
-      "name": "Scrape a URL and get content as markdown or other formats"
+      "id": "99361014-026f-4e93-b478-ed9f47b171fe",
+      "name": "Sticky Note7"
     },
     {
       "parameters": {
-        "operation": "batchScrape",
-        "urls": "={{ $json.contentUrls }}",
-        "scrapeOptions": {
+        "conditions": {
           "options": {
-            "headers": {}
-          }
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "3fd61671-365b-42b2-89b3-acb15541e737",
+              "leftValue": "={{ $json.output.action }}",
+              "rightValue": "visit",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
         },
-        "requestOptions": {}
+        "options": {}
       },
-      "type": "@mendable/n8n-nodes-firecrawl.firecrawl",
-      "typeVersion": 1,
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
       "position": [
-        896,
-        -192
+        768,
+        208
       ],
-      "id": "89f0270e-b36a-4fb0-a4b2-533ba07bb1e4",
-      "name": "Batch scrape multiple URLs simultaneously"
+      "id": "eb84f522-3f78-4d3e-978a-0405656b99b6",
+      "name": "Visit URL?"
     },
     {
       "parameters": {
-        "maxItems": 3
+        "fieldToSplitOut": "urls",
+        "include": "selectedOtherFields",
+        "fieldsToInclude": "emailId, senderEmail, subject",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.splitOut",
+      "typeVersion": 1,
+      "position": [
+        -176,
+        208
+      ],
+      "id": "e1659fd0-4368-4db9-ae0d-15ca1c1bc247",
+      "name": "Split Out URLs"
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=Assess this URL:\n\nURL: {{ $json.urls.url }}\nType: {{ $json.urls.type }}\nLink text: {{ $json.urls.anchorText }}\nContext before: {{ $json.urls.contextBefore }}\nContext after: {{ $json.urls.contextAfter }}\n\nEmail subject: {{ $json.senderEmail }}\nEmail sender: {{ $json.subject }}",
+        "hasOutputParser": true,
+        "messages": {
+          "messageValues": [
+            {
+              "message": "You assess whether a URL from a newsletter is worth fetching and reading for a daily content briefing. You do NOT visit URLs — you only look at the URL string, link text, and surrounding context to make a judgment call.\n\nYou receive one URL at a time with its metadata.\n\n## DECISION CRITERIA\n\n**VISIT** — the URL is likely a specific piece of content worth reading:\n- Article, blog post, or report (path has a slug, date, ID, descriptive words)\n- Product launch, changelog, or announcement\n- Research paper, whitepaper, documentation\n- Newsletter archive page with distinct content\n- Specific social media post (YouTube video, Instagram post, tweet)\n- The surrounding context describes something substantive or newsworthy\n- Tracking/redirect URLs where the context clearly describes real content behind the link\n\n**SKIP** — the URL is unlikely to have content worth reading:\n- Generic homepage or landing page (e.g. bare domain with no path)\n- User profile, account, settings, or dashboard page\n- Unsubscribe, preferences, or email management link\n- Social media profile root (no specific post)\n- Tracking pixel, beacon, or image asset\n- App store download link\n- Generic category, tag, or topic listing page\n- Shopping, cart, checkout, or promotional pages\n- \"View in browser\" or \"web version\" links\n- Referral or invite links\n\n**When in doubt, lean toward VISIT.** It's better to fetch something marginal than miss something good.\n\n## INTEREST PROFILE\n\nWhen you assess a URL, also predict which interest bucket it likely falls into based on the context:\n\n**primary** — Owner actively wants this content:\n- AI/ML, LLMs, foundation models, developer tools, AI infrastructure\n- Finance, markets, investing, economics, macro trends\n- Startups, entrepreneurship, venture capital, fundraising\n- Healthcare, healthtech, pharma, biotech, patient services\n- SaaS, product strategy, B2B software, GTM\n- Software engineering, systems design, data engineering\n- Technology industry news and deep analysis\n\n**secondary** — Useful but lower priority:\n- Parenting, baby care, child development\n- General health, wellness, fitness, nutrition\n- Cooking, meal prep, recipes\n- Travel, lifestyle, automotive\n- Personal finance basics (budgeting, savings, real estate)\n\n**unknown** — Not enough information to classify yet (this is fine — we'll classify properly after reading the content)\n\n## TRACKING / REDIRECT URLs\n\nMany newsletter URLs are wrapped in tracking redirects (e.g. `clicks.beehiiv.com/...`, `links.morningbrew.com/...`). You cannot tell the destination from the URL string alone.\n\nFor these: look at the link text and surrounding context. If the context describes real content (an article title, a topic, a news event), mark as VISIT. If the context is promotional (\"shop now\", \"claim your offer\") or there's no useful context at all, mark as SKIP.\n\n## IMPORTANT\n\n- You are making a quick triage decision, not a deep analysis\n- One clear reason is enough — don't over-explain\n- When context is rich (good anchor text, descriptive surrounding text), trust it\n- When context is absent and the URL is opaque (tracking redirect with no clues), default to SKIP"
+            }
+          ]
+        },
+        "batching": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.chainLlm",
+      "typeVersion": 1.9,
+      "position": [
+        304,
+        208
+      ],
+      "id": "7155b850-1934-4ad4-9e51-95e5bddba8f7",
+      "name": "URL Quality Filter"
+    },
+    {
+      "parameters": {
+        "schemaType": "manual",
+        "inputSchema": "{\n  \"type\": \"object\",\n  \"properties\": {\n    \"action\": {\n      \"type\": \"string\",\n      \"enum\": [\"visit\", \"skip\"],\n      \"description\": \"Whether to fetch this URL or skip it\"\n    },\n    \"reason\": {\n      \"type\": \"string\",\n      \"description\": \"Brief explanation for the decision, 5-15 words\"\n    },\n    \"predicted_bucket\": {\n      \"type\": \"string\",\n      \"enum\": [\"primary\", \"secondary\", \"unknown\"],\n      \"description\": \"Predicted interest category based on available context\"\n    },\n    \"predicted_tags\": {\n      \"type\": \"array\",\n      \"items\": { \"type\": \"string\" },\n      \"description\": \"1-3 lowercase topic tags predicted from context, e.g. ai, pharma, parenting\"\n    }\n  },\n  \"required\": [\"action\", \"reason\", \"predicted_bucket\", \"predicted_tags\"]\n}",
+        "autoFix": true
+      },
+      "type": "@n8n/n8n-nodes-langchain.outputParserStructured",
+      "typeVersion": 1.3,
+      "position": [
+        400,
+        432
+      ],
+      "id": "1538a387-46d5-4551-b218-b4bd29314d29",
+      "name": "Structure URL Quality Filter Output"
+    },
+    {
+      "parameters": {
+        "schemaType": "manual",
+        "inputSchema": "{\n  \"type\": \"object\",\n  \"properties\": {\n    \"category\": {\n      \"type\": \"string\",\n      \"enum\": [\"visit\", \"skip\"],\n      \"description\": \"Whether this email should be processed or skipped\"\n    },\n    \"reason\": {\n      \"type\": \"string\",\n      \"description\": \"Brief 5-10 word explanation for the classification\"\n    }\n  },\n  \"required\": [\"category\", \"reason\"]\n}",
+        "autoFix": true
+      },
+      "type": "@n8n/n8n-nodes-langchain.outputParserStructured",
+      "typeVersion": 1.3,
+      "position": [
+        -992,
+        608
+      ],
+      "id": "2f710c24-4427-414a-bada-b4fdd6616968",
+      "name": "Structure Email Quality Filter Output"
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatGoogleGemini",
+      "typeVersion": 1,
+      "position": [
+        272,
+        432
+      ],
+      "id": "42ce93ec-d37b-4ad2-856a-0e2c89d82505",
+      "name": "Gemini URL Quality Filter"
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatGoogleGemini",
+      "typeVersion": 1,
+      "position": [
+        480,
+        640
+      ],
+      "id": "c9b77332-fee0-4a1a-ac6f-1fa71770ee9f",
+      "name": "Gemini URL Quality Filter Structuring"
+    },
+    {
+      "parameters": {
+        "maxItems": 10
       },
       "type": "n8n-nodes-base.limit",
       "typeVersion": 1,
       "position": [
-        1120,
-        0
+        48,
+        208
       ],
-      "id": "3963b545-9e23-4087-8775-724b05036aef",
-      "name": "Limit"
+      "id": "cf463a38-0d23-418d-9ccb-31d4a0b87744",
+      "name": "Limit1"
     },
     {
       "parameters": {
-        "content": "Jina can read tracking URLs! cool, add back in?\n\nwill get costly perhaps?"
+        "promptType": "define",
+        "text": "=Write a briefing entry for this article.\n\nTitle: {{ $json.title }}\nDescription: {{ $json.description }}\nURL: {{ $json.metadata['og:url'] }}\n\nContent (first 5000 chars):\n{{ $json.content.substring(0, 5000) }}",
+        "hasOutputParser": true,
+        "messages": {
+          "messageValues": [
+            {
+              "message": "You produce entries for a daily content briefing. You receive an article's title, description, and full text. Your job is to write a concise, opinionated briefing entry that tells the reader what happened and why it matters.\n\n## WRITING STYLE\n\n- Lead with the takeaway, not the setup. \"Anthropic released Claude 4.5 with 2x context window\" not \"Anthropic has announced a new model.\"\n- Be specific. Include names, numbers, dates, and concrete details.\n- Be opinionated about significance. \"This matters because...\" or \"This is incremental — the real story is...\" are both fine.\n- Skip filler. No \"In this article...\" or \"The author discusses...\" — just say what the thing is.\n- Write for someone scanning 20+ items over coffee. Every word should earn its place.\n- 2-4 sentences for the summary. One sentence is fine if the content is simple.\n\n## INTEREST CATEGORIES\n\nClassify into exactly one:\n\n**primary** — Core reading:\n- AI/ML, LLMs, foundation models, developer tools, AI infrastructure\n- Finance, markets, investing, economics, macro trends\n- Startups, entrepreneurship, venture capital, fundraising\n- Healthcare, healthtech, pharma, biotech, patient services\n- SaaS, product strategy, B2B software, GTM\n- Software engineering, systems design, data engineering\n- Technology industry news and deep analysis\n\n**secondary** — Useful, lower priority:\n- Parenting, baby care, child development\n- General health, wellness, fitness, nutrition\n- Cooking, meal prep, recipes\n- Travel, lifestyle, automotive\n- Personal finance basics (budgeting, savings, real estate)\n\n## TAGS\n\nPick 1-3 short lowercase tags that capture the topic. Use consistent vocabulary:\nai, ml, llm, dev-tools, infra, finance, markets, investing, startups, vc, healthcare, pharma, biotech, saas, product, engineering, data, parenting, fitness, nutrition, cooking, travel, automotive, real-estate, personal-finance\n\n## EDGE CASES\n\n- If the content is paywalled, truncated, or garbled, summarize what you can and note it.\n- If the content is clearly promotional (product ad disguised as article), say so and still classify it.\n- If the title and content don't match (clickbait), summarize the actual content, not the title."
+            }
+          ]
+        },
+        "batching": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.chainLlm",
+      "typeVersion": 1.9,
+      "position": [
+        1248,
+        32
+      ],
+      "id": "35d5b20a-3426-4e2c-b22a-a0c88d275c9b",
+      "name": "URL Content Summarizer"
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatGoogleGemini",
+      "typeVersion": 1,
+      "position": [
+        1216,
+        256
+      ],
+      "id": "ea9cc1ae-7bb0-4db1-91d4-39e523330e39",
+      "name": "Gemini URL Content Summarizer"
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatGoogleGemini",
+      "typeVersion": 1,
+      "position": [
+        1424,
+        464
+      ],
+      "id": "c3f29cd8-9605-471b-bda2-90fbb01ec113",
+      "name": "Gemini URL Content Summarizer Structuring"
+    },
+    {
+      "parameters": {
+        "schemaType": "manual",
+        "inputSchema": "{\n  \"type\": \"object\",\n  \"properties\": {\n    \"headline\": {\n      \"type\": \"string\",\n      \"description\": \"A rewritten headline that captures the key takeaway, 5-15 words. Not the original title — your version.\"\n    },\n    \"summary\": {\n      \"type\": \"string\",\n      \"description\": \"2-4 sentence briefing summary. Lead with the takeaway, be specific and opinionated.\"\n    },\n    \"bucket\": {\n      \"type\": \"string\",\n      \"enum\": [\"primary\", \"secondary\"],\n      \"description\": \"Interest classification\"\n    },\n    \"tags\": {\n      \"type\": \"array\",\n      \"items\": { \"type\": \"string\" },\n      \"description\": \"1-3 lowercase topic tags from the standard vocabulary\"\n    },\n    \"significance\": {\n      \"type\": \"string\",\n      \"enum\": [\"high\", \"medium\", \"low\"],\n      \"description\": \"How important this is within its category. High = breaking/major, medium = notable, low = incremental/routine.\"\n    },\n    \"content_quality\": {\n      \"type\": \"string\",\n      \"enum\": [\"full\", \"partial\", \"garbled\"],\n      \"description\": \"Whether the source content was complete, paywalled/truncated, or unreadable\"\n    }\n  },\n  \"required\": [\"headline\", \"summary\", \"bucket\", \"tags\", \"significance\", \"content_quality\"]\n}",
+        "autoFix": true
+      },
+      "type": "@n8n/n8n-nodes-langchain.outputParserStructured",
+      "typeVersion": 1.3,
+      "position": [
+        1344,
+        256
+      ],
+      "id": "156874f2-1aee-499d-a468-fc84f83b4eea",
+      "name": "Structure URL Content Summarizer"
+    },
+    {
+      "parameters": {
+        "content": "Improvements\n\n- deduplication of URLs?\n- add a \"DO NOT INCLUDE NON NEWSLETTER\" filter incase the labeling tool fails me"
       },
       "type": "n8n-nodes-base.stickyNote",
-      "position": [
-        1488,
-        272
-      ],
       "typeVersion": 1,
-      "id": "44806dbc-a87f-45ed-b8f4-2bd008548d81",
+      "position": [
+        2336,
+        0
+      ],
+      "id": "9eca3ad1-8749-4568-abfb-6d566ad578a0",
       "name": "Sticky Note"
     },
     {
       "parameters": {
-        "content": "Phase 2: Crawl & Summarize\nFor each extracted URL, you need to:\n\nFetch the page content — n8n's HTTP Request node can do this, but many sites return JS-rendered pages that won't have content in the raw HTML. Options:\n\nHTTP Request node (fast, free, works for most editorial content)\nA headless browser service like Browserless or ScrapingBee if you hit JS-heavy sites\nStart with HTTP Request and only escalate if you're getting empty bodies\n\n\nExtract readable content — You need something like Readability (Mozilla's algorithm) to strip nav, ads, sidebars and get the article text. You can do this in a Code node using a library, or just pass the raw HTML to an LLM and ask it to extract the article content (works surprisingly well but burns tokens).\nSummarize — Send extracted text to Claude/GPT via an AI node. Per-article summaries should capture: headline, key points, why it matters, and any notable data/quotes.\n\nKey decision: Summarize per-article or batch? I'd recommend per-article summaries first, then a final synthesis pass. This gives you granularity and also lets the final pass do the topic clustering with full context.\nRate limiting matters here. If a newsletter has 15 links and you're processing 10 newsletters, that's 150 HTTP requests + 150 LLM calls. You'll want:\n\nA reasonable concurrency limit (don't blast 150 requests simultaneously)\nError handling for 403s, timeouts, paywalled content\nA fallback for paywalled articles (just note \"paywalled — title only\" in the briefing)"
+        "promptType": "define",
+        "text": "=Today's headlines:\n\n{{ $json.llmOverviewInput }}",
+        "messages": {
+          "messageValues": [
+            {
+              "message": "You write the opening paragraph for a daily content briefing. You receive a list of today's article headlines with their significance level [high/medium/low].\n\nWrite 2-4 sentences that:\n- Lead with the 1-2 most important stories\n- Give the reader a reason to keep scrolling\n- Sound like a sharp editor, not a news anchor\n- Don't enumerate every headline — pull out the threads that matter\n\nUnder 80 words. No greeting. No sign-off. No \"here's what's in today's briefing.\" Just the hook."
+            }
+          ]
+        },
+        "batching": {}
       },
-      "type": "n8n-nodes-base.stickyNote",
-      "typeVersion": 1,
+      "type": "@n8n/n8n-nodes-langchain.chainLlm",
+      "typeVersion": 1.9,
       "position": [
-        1472,
-        -224
+        2384,
+        384
       ],
-      "id": "aa8f8ea2-5669-4293-abe4-ebab891bb630",
-      "name": "Sticky Note1"
+      "id": "2789a7f6-6630-45fd-9f60-543572ccc4ab",
+      "name": "Basic LLM Chain"
     },
     {
       "parameters": {
-        "content": "Phase 3: Organize & Brief\nThis is where a single LLM call takes all the per-article summaries and produces the final briefing. Your prompt should instruct it to:\n\nGroup by topic/sector (healthcare, tech, policy, etc.)\nHighlight the most interesting/important items at the top\nInclude every article with its summary and source link\nFlag any themes that appeared across multiple newsletters\n\nOutput format decision: Markdown? HTML? PDF? I'd suggest Markdown that renders well in email, since you'll probably want this delivered to your inbox or a notes app."
+        "modelName": "models/gemini-pro-latest",
+        "options": {}
       },
-      "type": "n8n-nodes-base.stickyNote",
+      "type": "@n8n/n8n-nodes-langchain.lmChatGoogleGemini",
       "typeVersion": 1,
       "position": [
-        2240,
-        -64
+        2464,
+        608
       ],
-      "id": "fabe3327-1e65-4113-8893-1721f8534aaf",
-      "name": "Sticky Note2"
+      "id": "7d4246df-dc3b-4082-af12-26a8761ff7f0",
+      "name": "Google Gemini Chat Model"
     },
     {
       "parameters": {
-        "content": "Phase 4: Deliver\nOptions:\n\nEmail to yourself (Gmail Send node) — simplest\nSave to Google Doc — nice for archival/search\nPost to Notion/Obsidian — if you want a knowledge base\nAll of the above — the briefing is just text, easy to fan out"
+        "jsCode": "// ============================================================\n// n8n Code Node: Assemble Daily Briefing (Astro)\n// ============================================================\n// Input: Merged items from 3-way merge:\n//   - Visited URLs:  { read: { headline, summary, bucket, ... }, url, ... }\n//   - Skipped URLs:  { skipped: { reason, predicted_bucket, ... }, url, ... }\n//   - Rejected emails: { category: \"reject\", reason, sender, subject, ... }\n//   - Possibly empty objects {} from merge padding\n//\n// Output:\n//   - llmOverviewInput, mainMarkdown, debugMarkdown\n//   - stats, dateSlug, dateStr, topTags\n// ============================================================\n\nconst items = $input.all();\nconst now = new Date();\nconst dateStr = now.toLocaleDateString('en-US', {\n  weekday: 'long',\n  year: 'numeric',\n  month: 'long',\n  day: 'numeric',\n});\nconst dateSlug = now.toISOString().split('T')[0];\n\n// --- Categorize items ---\n\nconst visited = [];\nconst skipped = [];\nconst failed = [];\nconst rejected = [];\n\nfor (const item of items) {\n  const d = item.json;\n\n  // Skip empty objects from merge padding\n  if (!d || Object.keys(d).length === 0) continue;\n\n  // Rejected emails from pre-filter\n  if (d.category === 'reject') {\n    rejected.push(d);\n    continue;\n  }\n\n  // Visited URLs — identified by having a `read` object\n  if (d.read?.headline) {\n    visited.push(d);\n    continue;\n  }\n\n  // Skipped URLs — identified by having a `skipped` object\n  if (d.skipped) {\n    skipped.push(d);\n    continue;\n  }\n\n  // Failed URLs — have a url but no read or skipped\n  if (d.url && d.status === 'failed') {\n    failed.push(d);\n    continue;\n  }\n\n  // Anything else with a URL that didn't get processed — treat as skipped\n  if (d.url) {\n    skipped.push(d);\n    continue;\n  }\n\n  // Truly unknown — ignore\n}\n\n// --- Sort visited by significance ---\n\nconst sigOrder = { high: 0, medium: 1, low: 2 };\n\nconst primary = visited\n  .filter(d => d.read.bucket === 'primary')\n  .sort((a, b) => (sigOrder[a.read.significance] || 2) - (sigOrder[b.read.significance] || 2));\n\nconst secondary = visited\n  .filter(d => d.read.bucket === 'secondary')\n  .sort((a, b) => (sigOrder[a.read.significance] || 2) - (sigOrder[b.read.significance] || 2));\n\n// --- Helpers ---\n\nfunction getTopTags(items, limit) {\n  const counts = {};\n  for (const d of items) {\n    for (const tag of (d.read?.tags || [])) {\n      counts[tag] = (counts[tag] || 0) + 1;\n    }\n  }\n  return Object.entries(counts)\n    .sort((a, b) => b[1] - a[1])\n    .slice(0, limit)\n    .map(([tag, count]) => ({ tag, count }));\n}\n\nfunction badge(sig) {\n  if (sig === 'high') return '🔴';\n  if (sig === 'medium') return '🟡';\n  return '⚪';\n}\n\nfunction qualityNote(q) {\n  if (q === 'partial') return ' *(partial content)*';\n  if (q === 'garbled') return ' *(content quality issues)*';\n  return '';\n}\n\nfunction esc(str) {\n  if (!str) return '';\n  return str.replace(/\\|/g, '\\\\|').replace(/\\n/g, ' ');\n}\n\nfunction truncate(str, len) {\n  if (!str) return '';\n  return str.length > len ? str.slice(0, len - 3) + '...' : str;\n}\n\n// --- Stats ---\n\nconst topTags = getTopTags(visited, 8);\n\nconst stats = {\n  date: dateStr,\n  primaryCount: primary.length,\n  secondaryCount: secondary.length,\n  skippedCount: skipped.length,\n  failedCount: failed.length,\n  rejectedCount: rejected.length,\n  topTags,\n};\n\n// =====================\n// MAIN BRIEFING\n// =====================\n\nfunction articleBlock(d) {\n  const link = d.url || '';\n  const tags = (d.read.tags || []).map(t => `\\`${t}\\``).join(' ');\n  const source = d.senderEmail ? ` · via *${esc(d.senderEmail)}*` : '';\n\n  return [\n    `### ${badge(d.read.significance)} ${esc(d.read.headline)}`,\n    '',\n    d.read.summary + qualityNote(d.read.content_quality),\n    '',\n    `${tags}${link ? ` · [Read →](${link})` : ''}${source}`,\n  ].join('\\n');\n}\n\nconst main = [];\n\n// Stats bar\nmain.push(`> **${primary.length}** primary · **${secondary.length}** secondary · **${skipped.length}** skipped · **${failed.length}** failed · **${rejected.length}** emails rejected`);\nif (topTags.length > 0) {\n  main.push(`>`);\n  main.push(`> Top topics: ${topTags.map(t => `${t.tag} (${t.count})`).join(', ')}`);\n}\nmain.push('');\n\n// Overview placeholder\nmain.push('<!-- OVERVIEW_PLACEHOLDER -->');\nmain.push('');\n\n// Primary\nif (primary.length > 0) {\n  main.push('---');\n  main.push('');\n  main.push('## Primary');\n  main.push('');\n  for (const d of primary) {\n    main.push(articleBlock(d));\n    main.push('');\n    main.push('---');\n    main.push('');\n  }\n}\n\n// Secondary\nif (secondary.length > 0) {\n  main.push('## Secondary');\n  main.push('');\n  for (const d of secondary) {\n    main.push(articleBlock(d));\n    main.push('');\n    main.push('---');\n    main.push('');\n  }\n}\n\n// Debug link\nmain.push('');\nmain.push(`<small>[View processing log →](/briefings/${dateSlug}/debug)</small>`);\n\n// =====================\n// DEBUG POST\n// =====================\n\nconst debug = [];\n\ndebug.push('---');\ndebug.push(`title: \"Processing Log — ${dateStr}\"`);\ndebug.push(`date: \"${dateSlug}\"`);\ndebug.push(`description: \"Debug log for the ${dateStr} daily briefing\"`);\ndebug.push(`hidden: true`);\ndebug.push(`draft: false`);\ndebug.push('---');\ndebug.push('');\ndebug.push(`<small>[← Back to briefing](/briefings/${dateSlug})</small>`);\ndebug.push('');\ndebug.push(`> ${visited.length} visited · ${skipped.length} skipped · ${failed.length} failed · ${rejected.length} emails rejected`);\ndebug.push('');\n\n// --- Rejected emails ---\nif (rejected.length > 0) {\n  debug.push('## Rejected Emails');\n  debug.push('');\n  debug.push('Emails classified as low-value. Unsubscribe candidates.');\n  debug.push('');\n  debug.push('| Sender | Subject | Reason |');\n  debug.push('|---|---|---|');\n  for (const d of rejected) {\n    const sender = esc(d.senderEmail || d.sender || d.sender_email || 'unknown');\n    const subject = esc(truncate(d.subject, 60));\n    const reason = esc(d.reason || '');\n    debug.push(`| ${sender} | ${subject} | ${reason} |`);\n  }\n  debug.push('');\n}\n\n// --- Skipped URLs ---\nif (skipped.length > 0) {\n  // Group skipped by email for readability\n  const skippedByEmail = {};\n  for (const d of skipped) {\n    const key = d.senderEmail || d.sender || 'unknown';\n    if (!skippedByEmail[key]) {\n      skippedByEmail[key] = { subject: d.subject || '', items: [] };\n    }\n    skippedByEmail[key].items.push(d);\n  }\n\n  debug.push('## Skipped URLs');\n  debug.push('');\n\n  for (const [sender, group] of Object.entries(skippedByEmail)) {\n    debug.push(`### ${esc(sender)}`);\n    debug.push(`*${esc(group.subject)}*`);\n    debug.push('');\n    debug.push('| URL | Reason | Predicted Bucket |');\n    debug.push('|---|---|---|');\n    for (const d of group.items) {\n      const url = esc(truncate(d.url || '', 60));\n      const reason = esc(d.skipped?.reason || d.skipReason || 'no reason');\n      const bucket = d.skipped?.predicted_bucket || '—';\n      debug.push(`| ${url} | ${reason} | ${bucket} |`);\n    }\n    debug.push('');\n  }\n}\n\n// --- Failed URLs ---\nif (failed.length > 0) {\n  debug.push('## Failed URLs');\n  debug.push('');\n  debug.push('| URL | Error | Source |');\n  debug.push('|---|---|---|');\n  for (const d of failed) {\n    debug.push(`| ${esc(truncate(d.url || '', 60))} | ${esc(d.skipReason || d.error || 'Read failed')} | ${esc(d.senderEmail || '')} |`);\n  }\n  debug.push('');\n}\n\n// --- Per-newsletter stats ---\ndebug.push('## Per-Newsletter Stats');\ndebug.push('');\ndebug.push('| Source | Subject | Visited | Skipped | Failed |');\ndebug.push('|---|---|---|---|---|');\n\nconst emailStats = {};\nfor (const d of visited) {\n  const key = d.senderEmail || 'unknown';\n  if (!emailStats[key]) emailStats[key] = { subject: d.subject || '', visited: 0, skipped: 0, failed: 0 };\n  emailStats[key].visited++;\n}\nfor (const d of skipped) {\n  const key = d.senderEmail || 'unknown';\n  if (!emailStats[key]) emailStats[key] = { subject: d.subject || '', visited: 0, skipped: 0, failed: 0 };\n  emailStats[key].skipped++;\n}\nfor (const d of failed) {\n  const key = d.senderEmail || 'unknown';\n  if (!emailStats[key]) emailStats[key] = { subject: d.subject || '', visited: 0, skipped: 0, failed: 0 };\n  emailStats[key].failed++;\n}\nfor (const [email, s] of Object.entries(emailStats)) {\n  const pct = s.visited + s.skipped + s.failed > 0\n    ? Math.round((s.visited / (s.visited + s.skipped + s.failed)) * 100)\n    : 0;\n  debug.push(`| ${esc(email)} | ${esc(truncate(s.subject, 45))} | ${s.visited} | ${s.skipped} | ${s.failed} |`);\n}\ndebug.push('');\n\n// --- Raw data ---\ndebug.push('## Raw Data');\ndebug.push('');\ndebug.push('<details>');\ndebug.push('<summary>Visited items (JSON)</summary>');\ndebug.push('');\ndebug.push('```json');\ndebug.push(JSON.stringify(visited, null, 2));\ndebug.push('```');\ndebug.push('');\ndebug.push('</details>');\ndebug.push('');\ndebug.push('<details>');\ndebug.push('<summary>Skipped items (JSON)</summary>');\ndebug.push('');\ndebug.push('```json');\ndebug.push(JSON.stringify(skipped, null, 2));\ndebug.push('```');\ndebug.push('');\ndebug.push('</details>');\ndebug.push('');\ndebug.push('<details>');\ndebug.push('<summary>Failed items (JSON)</summary>');\ndebug.push('');\ndebug.push('```json');\ndebug.push(JSON.stringify(failed, null, 2));\ndebug.push('```');\ndebug.push('');\ndebug.push('</details>');\ndebug.push('');\ndebug.push('<details>');\ndebug.push('<summary>Rejected emails (JSON)</summary>');\ndebug.push('');\ndebug.push('```json');\ndebug.push(JSON.stringify(rejected, null, 2));\ndebug.push('```');\ndebug.push('');\ndebug.push('</details>');\n\n// --- LLM overview input ---\n\nconst overviewInput = primary\n  .map(d => `[${d.read.significance}] ${d.read.headline}`)\n  .concat(secondary.map(d => `[${d.read.significance}] (secondary) ${d.read.headline}`))\n  .join('\\n');\n\n// --- Return ---\n\nreturn [{\n  json: {\n    llmOverviewInput: overviewInput,\n    mainMarkdown: main.join('\\n'),\n    debugMarkdown: debug.join('\\n'),\n    stats,\n    dateSlug,\n    dateStr,\n    topTags: topTags.slice(0, 5).map(t => t.tag),\n  }\n}];"
       },
-      "type": "n8n-nodes-base.stickyNote",
-      "typeVersion": 1,
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
       "position": [
-        2848,
+        2160,
+        384
+      ],
+      "id": "a6b81635-ba8c-4555-a54a-4e00001b4d1f",
+      "name": "Assemble Briefing"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// n8n Code Node: Finalize Briefing (post-LLM overview)\n// ============================================================\n// Splices overview into markdown, adds frontmatter, base64 encodes\n// for GitHub API publish.\n// ============================================================\n\nconst assembler = $('Assemble Briefing').item.json;\n\n// LLM overview — adjust field name to match your LLM chain output\nconst overview = $json.text || $json.output || '';\n\nconst { dateSlug, dateStr, topTags, stats } = assembler;\n\n// --- Splice overview ---\n\nconst mainBody = assembler.mainMarkdown\n  .replace('<!-- OVERVIEW_PLACEHOLDER -->', overview);\n\n// --- Frontmatter ---\n\nconst frontmatter = [\n  '---',\n  `title: \"Daily Briefing — ${dateStr}\"`,\n  `date: \"${dateSlug}\"`,\n  `description: \"${stats.primaryCount} primary, ${stats.secondaryCount} secondary items\"`,\n  `tags: [${(topTags || []).map(t => `\"${t}\"`).join(', ')}]`,\n  `hidden: false`,\n  `draft: false`,\n  '---',\n].join('\\n');\n\nconst mainPost = frontmatter + '\\n\\n' + mainBody;\nconst debugPost = assembler.debugMarkdown;\n\n// --- File paths ---\n\nconst mainPath = `src/content/briefings/${dateSlug}/index.md`;\nconst debugPath = `src/content/briefings/${dateSlug}/debug.md`;\n\n// --- Base64 for GitHub API ---\n\nconst mainPostB64 = Buffer.from(mainPost, 'utf-8').toString('base64');\nconst debugPostB64 = Buffer.from(debugPost, 'utf-8').toString('base64');\n\nreturn [{\n  json: {\n    mainPost,\n    debugPost,\n    mainPostB64,\n    debugPostB64,\n    mainPath,\n    debugPath,\n    dateSlug,\n    dateStr,\n    stats,\n    overview,\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2736,
+        384
+      ],
+      "id": "c52cbbfe-39cb-48fd-a291-1194b5af43e9",
+      "name": "Finalize Briefing"
+    },
+    {
+      "parameters": {
+        "numberInputs": 3
+      },
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3.2,
+      "position": [
+        1936,
+        368
+      ],
+      "id": "78c50fca-2a5d-4731-8d78-b2852c27ee66",
+      "name": "Merge"
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        1712,
+        656
+      ],
+      "id": "3e65ad1e-3193-4763-b782-bec1d5afd9e1",
+      "name": "Prepare Skipped Emails"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "dd2502eb-f2a9-4dbe-8c43-c5c12d0895c0",
+              "name": "emailId",
+              "value": "={{ $('Split Out URLs').item.json.emailId }}",
+              "type": "string"
+            },
+            {
+              "id": "fc3e0f7b-3090-4bc8-b330-9b89e8f99701",
+              "name": "senderEmail",
+              "value": "={{ $('Split Out URLs').item.json.senderEmail }}",
+              "type": "string"
+            },
+            {
+              "id": "feab901a-fd8a-4456-8034-2168cb6d0fa1",
+              "name": "subject",
+              "value": "={{ $('Split Out URLs').item.json.subject }}",
+              "type": "string"
+            },
+            {
+              "id": "44e4a203-fe18-4dff-bdcf-202b5402136d",
+              "name": "url",
+              "value": "={{ $('Read URL Content').item.json.url }}",
+              "type": "string"
+            },
+            {
+              "id": "0ba58b82-b6e7-4f21-9393-2614a6a6f958",
+              "name": "title",
+              "value": "={{ $('Read URL Content').item.json.title }}",
+              "type": "string"
+            },
+            {
+              "id": "c3d07b18-1e68-41ce-bccc-4015a9a925d7",
+              "name": "description",
+              "value": "={{ $('Read URL Content').item.json.description }}",
+              "type": "string"
+            },
+            {
+              "id": "7eecbae7-83ad-445d-9e85-5c8d2fdcdcb0",
+              "name": "read.headline",
+              "value": "={{ $json.output.headline }}",
+              "type": "string"
+            },
+            {
+              "id": "4ec862d1-d652-4027-97b7-24bfea47d5b6",
+              "name": "read.summary",
+              "value": "={{ $json.output.summary }}",
+              "type": "string"
+            },
+            {
+              "id": "107ad03f-6777-4f4f-b991-28e3c48c7cac",
+              "name": "read.bucket",
+              "value": "={{ $json.output.bucket }}",
+              "type": "string"
+            },
+            {
+              "id": "122ec809-d43c-4426-a04f-149e1b7fd848",
+              "name": "read.tags",
+              "value": "={{ $json.output.tags }}",
+              "type": "array"
+            },
+            {
+              "id": "18dff915-0c21-46fb-a598-a744a45308e6",
+              "name": "read.significance",
+              "value": "={{ $json.output.significance }}",
+              "type": "string"
+            },
+            {
+              "id": "3b767b5d-9fe2-4cab-99bb-239d175521a8",
+              "name": "read.content_quality",
+              "value": "={{ $json.output.content_quality }}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        1712,
         32
       ],
-      "id": "0298c30c-3226-4fa9-91d5-39e95ab1e040",
-      "name": "Sticky Note3"
+      "id": "3dd2c198-8cf1-4093-94e5-a1d2ce30ae82",
+      "name": "Prepare Read URLs"
     },
     {
       "parameters": {
-        "content": "Retroactive Processing\nYes, this is straightforward. The approach:\nCreate a separate \"backfill\" workflow (or a branch of the same one) that:\n\nTakes a startDate and endDate as input parameters\nFetches all \"Newsletter\"-labeled emails in that window\nGroups them by date (the date they were received)\nProcesses each day's batch through the same pipeline\nProduces one briefing per day\n\nYou'd trigger this manually or with a loop that walks backward day by day. The main thing to watch: rate limits and execution time. n8n workflows have timeout limits (especially on n8n Cloud). For a big backfill:\n\nProcess one day at a time with a delay between days\nOr use n8n's \"Execute Workflow\" node to kick off sub-workflows per day\nConsider running this on self-hosted n8n if you're on Cloud, since backfills can be long-running\n\nYou'll also want to store completed briefings somewhere indexed by date so you can track progress and resume if something fails mid-backfill."
+        "assignments": {
+          "assignments": [
+            {
+              "id": "1887a05a-a7b8-4a90-a556-356999d06116",
+              "name": "emailId",
+              "value": "={{ $('Split Out URLs').item.json.emailId }}",
+              "type": "string"
+            },
+            {
+              "id": "4d808820-f860-4afb-ab8f-e4ba4bc7e47a",
+              "name": "senderEmail",
+              "value": "={{ $('Split Out URLs').item.json.senderEmail }}",
+              "type": "string"
+            },
+            {
+              "id": "a9a81564-f1f4-468e-b4fc-37cddcb39108",
+              "name": "subject",
+              "value": "={{ $('Split Out URLs').item.json.subject }}",
+              "type": "string"
+            },
+            {
+              "id": "ebe1431c-60b1-431c-b6cb-03497270bffe",
+              "name": "url",
+              "value": "={{ $('Split Out URLs').item.json.urls.url }}",
+              "type": "string"
+            },
+            {
+              "id": "149a1e9e-02dd-4d51-890a-261aa98bfbfe",
+              "name": "skipped.reason",
+              "value": "={{ $('URL Quality Filter').item.json.output.reason }}",
+              "type": "string"
+            },
+            {
+              "id": "97fee2cb-88d5-4929-b606-fe2275e5881c",
+              "name": "skipped.predicted_bucket",
+              "value": "={{ $('URL Quality Filter').item.json.output.predicted_bucket }}",
+              "type": "string"
+            },
+            {
+              "id": "77d15870-9416-467c-a6b6-d86a43eb00ad",
+              "name": "skipped.predicted_tags",
+              "value": "={{ $('URL Quality Filter').item.json.output.predicted_tags }}",
+              "type": "array"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        1712,
+        384
+      ],
+      "id": "a38ffed0-151a-410f-a76d-46c07dc90fe6",
+      "name": "Prepare Skipped URLs"
+    },
+    {
+      "parameters": {
+        "content": "Deduplicate urls?"
       },
       "type": "n8n-nodes-base.stickyNote",
       "typeVersion": 1,
       "position": [
-        128,
-        128
+        -240,
+        96
       ],
-      "id": "24d4626c-cc5b-4878-a066-b39c24187d11",
-      "name": "Sticky Note4"
-    },
-    {
-      "parameters": {
-        "content": "Bookmark Dumps — This Is the Interesting Problem\nThe challenge: you occasionally email yourself a huge list of URLs (50? 100?), and you don't want that to overwhelm a single day's briefing or blow up your LLM costs in one shot.\nA few approaches worth considering:\nOption A: Separate queue, drip into daily briefings. When a bookmark dump arrives, don't process it all at once. Instead, store the URLs in a queue (Google Sheet, Airtable, or even a dedicated Gmail draft). Then each day's briefing pulls N bookmarks from the queue (say 10-15) alongside the regular newsletters. This spreads the load and keeps briefings consistently sized. Downside: it could take a week to work through a big dump.\nOption B: Produce a separate \"Bookmark Digest\" document. Process the entire dump as its own thing — not a daily briefing but a \"Bookmark Review\" artifact. This could be organized by topic just like a briefing but isn't constrained to a day's cadence. You'd get a notification when it's ready.\nOption C: Hybrid — quick-triage first, then drip. When a dump comes in, do a fast pass: fetch each URL's title and meta description only (cheap, fast). Produce a \"triage list\" where you can quickly star/flag the ones you actually care about. Only the flagged ones get the full crawl-and-summarize treatment, and they drip into daily briefings.\nMy instinct is Option A is the simplest to build and keeps everything in one unified briefing format. You'd label bookmark dump emails differently (maybe \"Bookmarks\" label), and the daily workflow checks both the Newsletter label and the bookmark queue.\nFor the email format of bookmark dumps: I'd suggest just emailing yourself a plain text list of URLs, one per line, maybe with optional notes. Keep it dead simple. The workflow detects emails with the \"Bookmarks\" label, extracts URLs, appends them to the queue, and marks the email as processed."
-      },
-      "type": "n8n-nodes-base.stickyNote",
-      "typeVersion": 1,
-      "position": [
-        464,
-        128
-      ],
-      "id": "4ca301bf-efee-4f69-974a-a3f5d7885197",
-      "name": "Sticky Note5"
-    },
-    {
-      "parameters": {
-        "content": "remove me"
-      },
-      "type": "n8n-nodes-base.stickyNote",
-      "typeVersion": 1,
-      "position": [
-        1056,
-        -64
-      ],
-      "id": "c40784cc-d533-4199-b076-dff9a6ffb136",
+      "id": "891a142e-694d-4fe6-9807-8d61e22cdf51",
       "name": "Sticky Note6"
+    },
+    {
+      "parameters": {
+        "content": "Mark processed emails with a \".n8n/brief\" label to prevent reprocessing or code the email fetcher to respect dates (my preference) Plus we ought to be deleting dead newsletter emails"
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -2464,
+        464
+      ],
+      "id": "b6ab6a5b-8f1e-44bc-bee4-701df21b6e68",
+      "name": "Sticky Note8"
     }
   ],
   "connections": {
@@ -245,7 +728,7 @@
       "main": [
         [
           {
-            "node": "Provide Tracking URLs w/ Context",
+            "node": "Split Out URLs",
             "type": "main",
             "index": 0
           }
@@ -256,7 +739,7 @@
       "main": [
         [
           {
-            "node": "Extract URLs",
+            "node": "Email Quality Filter",
             "type": "main",
             "index": 0
           }
@@ -274,40 +757,280 @@
         ]
       ]
     },
-    "Provide Tracking URLs w/ Context": {
+    "Gemini Email Quality Filter": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Email Quality Filter",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gemini Email Quality Filter Structuring": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Structure Email Quality Filter Output",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Email Quality Filter": {
       "main": [
         [
           {
-            "node": "Split Out",
-            "type": "main",
-            "index": 0
-          },
-          {
-            "node": "Batch scrape multiple URLs simultaneously",
+            "node": "Include Email?",
             "type": "main",
             "index": 0
           }
         ]
       ]
     },
-    "Split Out": {
+    "Include Email?": {
       "main": [
         [
           {
-            "node": "Limit",
+            "node": "Extract URLs",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Prepare Skipped Emails",
             "type": "main",
             "index": 0
           }
         ]
       ]
     },
-    "Limit": {
+    "Read URL Content": {
       "main": [
         [
           {
-            "node": "Read URL content",
+            "node": "URL Content Summarizer",
             "type": "main",
             "index": 0
+          }
+        ]
+      ]
+    },
+    "Visit URL?": {
+      "main": [
+        [
+          {
+            "node": "Read URL Content",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Prepare Skipped URLs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Split Out URLs": {
+      "main": [
+        [
+          {
+            "node": "Limit1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "URL Quality Filter": {
+      "main": [
+        [
+          {
+            "node": "Visit URL?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Structure URL Quality Filter Output": {
+      "ai_outputParser": [
+        [
+          {
+            "node": "URL Quality Filter",
+            "type": "ai_outputParser",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Structure Email Quality Filter Output": {
+      "ai_outputParser": [
+        [
+          {
+            "node": "Email Quality Filter",
+            "type": "ai_outputParser",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gemini URL Quality Filter": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "URL Quality Filter",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gemini URL Quality Filter Structuring": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Structure URL Quality Filter Output",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Limit1": {
+      "main": [
+        [
+          {
+            "node": "URL Quality Filter",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gemini URL Content Summarizer": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "URL Content Summarizer",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gemini URL Content Summarizer Structuring": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Structure URL Content Summarizer",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Structure URL Content Summarizer": {
+      "ai_outputParser": [
+        [
+          {
+            "node": "URL Content Summarizer",
+            "type": "ai_outputParser",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "URL Content Summarizer": {
+      "main": [
+        [
+          {
+            "node": "Prepare Read URLs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Google Gemini Chat Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Basic LLM Chain",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Basic LLM Chain": {
+      "main": [
+        [
+          {
+            "node": "Finalize Briefing",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Assemble Briefing": {
+      "main": [
+        [
+          {
+            "node": "Basic LLM Chain",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge": {
+      "main": [
+        [
+          {
+            "node": "Assemble Briefing",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Skipped Emails": {
+      "main": [
+        [
+          {
+            "node": "Merge",
+            "type": "main",
+            "index": 2
+          }
+        ]
+      ]
+    },
+    "Prepare Read URLs": {
+      "main": [
+        [
+          {
+            "node": "Merge",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Skipped URLs": {
+      "main": [
+        [
+          {
+            "node": "Merge",
+            "type": "main",
+            "index": 1
           }
         ]
       ]
